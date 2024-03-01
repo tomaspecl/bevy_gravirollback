@@ -38,6 +38,20 @@ fn main() {
         WorldInspectorPlugin::new(),
         RollbackPlugin::default(),
     ))
+
+    //TODO: these should be probably automaticaly registered
+    .register_type::<RestoreStates>()
+    .register_type::<RestoreInputs>()
+    .register_type::<SaveStates>()
+    .register_type::<SnapshotInfo>()
+    .register_type::<RollbackMap>()
+    //and these too
+    .register_type::<RollbackID>()
+    .register_type::<Exists>()
+    .register_type::<Rollback<Exists>>()
+
+    .register_type::<Rollback<Transform>>()
+
     .insert_resource(AmbientLight {
         color: Color::rgb(1.0,1.0,1.0),
         brightness: 0.2,
@@ -52,20 +66,18 @@ fn main() {
         get_input,
     ).in_set(RollbackProcessSet::HandleIO))
 
-    .add_systems(RollbackSchedule,(                                                                             //
-        get_component_rollback_systems::<Transform>(),                                                          //
-        restore_resource::<PlayerInput>.in_set(RollbackSet::RestoreInputs),                                     //
-        save_resource_input::<PlayerInput>.in_set(RollbackSet::Save),//more like clear_input, TODO: is it needed//
+    .add_systems(RollbackSchedule,(     
+        Transform::get_default_rollback_systems(),                                                              //
+        restore_resource_option::<PlayerInput>.in_set(RollbackSet::RestoreInputs),                              //
+        save_resource_input_option::<PlayerInput>.in_set(RollbackSet::Save),//more like clear_input, TODO: is it needed//
     ))                                                                                                          //  THIS SHOULD BE AUTOMATIC
-    .insert_resource(RollbackRegistry {                                                                         //
-        getters: vec![getter::<Transform>],                                                                     //
-    })                                                                                                          //
-    .insert_resource(Rollback::<PlayerInput>::default())
+    .insert_resource(Rollback::<Option<PlayerInput>>::default())
     
     .add_systems(RollbackSchedule,(
         (
             jump,
             fall,
+            ball_existence,
         ).chain()
     ).in_set(RollbackSet::Update))
 
@@ -75,7 +87,7 @@ fn main() {
     app.run();
 }
 
-#[derive(Resource, Clone)]
+#[derive(Resource, Clone, Default)]  //TODO: remove Default requirement
 struct PlayerInput;
 
 #[derive(Component)]
@@ -142,7 +154,7 @@ fn spawn_ball2(transform: Transform, id: RollbackID, world: &mut World) -> Entit
     }).insert((
         BallMarker,
         id,
-        Rollback::<Existence>::default(),
+        Rollback::<Exists>::default(),
         make_rollback(transform),  // this will contain the snapshots of Transform for this entity
     )).id()
 }
@@ -159,18 +171,27 @@ fn spawn_ball3(transform: Transform, id: RollbackID) -> impl Fn(Commands, ResMut
         }).insert((
             BallMarker,
             id,
-            Rollback::<Existence>::default(),
+            make_rollback(Exists(true)),
             make_rollback(transform),  // this will contain the snapshots of Transform for this entity
         )).id()
     }
 }
 
-fn fall(mut q: Query<(Entity, &mut Transform), With<BallMarker>>, mut commands: Commands) {
-    let Ok((e, mut transform)) = q.get_single_mut() else {return};
+fn fall(mut q: Query<(&mut Exists, &mut Transform), With<BallMarker>>) {
+    let Ok((mut exists, mut transform)) = q.get_single_mut() else {return};
     transform.translation = transform.translation + transform.down() * 0.3;
     if transform.translation.y <= 0.0 {
         println!("despawning ball");
-        commands.entity(e).insert(RollbackDespawnMarker);
+        exists.0 = false;
+    }
+}
+
+fn ball_existence(mut q: Query<(&Exists, &mut Visibility), (With<BallMarker>, Changed<Exists>)>) {
+    let Ok((exists, mut visibility)) = q.get_single_mut() else {return};
+    if exists.0 {
+        *visibility = Visibility::Visible;
+    }else{
+        *visibility = Visibility::Hidden;
     }
 }
 
@@ -228,7 +249,7 @@ struct NewInputEvent {
 fn get_input(
     mut waiting: ResMut<WaitingInputs>,
     mut info: ResMut<SnapshotInfo>,
-    mut inputs: ResMut<Rollback<PlayerInput>>,
+    mut inputs: ResMut<Rollback<Option<PlayerInput>>>,
     //mut events: EventWriter<NewInputEvent>,
 ) {
     let max = 15;

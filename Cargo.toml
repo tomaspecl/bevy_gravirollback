@@ -7,8 +7,13 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+serialize = ["serde"]
+
 [dependencies]
 bevy = "0.12"
+bevy_utils = "0.12"
+serde = { version = "1", features = ["derive"], optional = true }
 
 # this should be only used for the examples
 [dev-dependencies]

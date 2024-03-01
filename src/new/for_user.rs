@@ -5,14 +5,7 @@ use bevy::ecs::schedule::SystemConfigs;
 
 // this file contains helper functions and structs for the library user
 
-pub fn get_component_rollback_systems<T: Component + Clone>() -> SystemConfigs {
-    (
-        restore::<T>.in_set(RollbackSet::Restore),
-        save::<T>.in_set(RollbackSet::Save)
-    ).into_configs()
-}
-
-pub fn make_rollback<T: Component>(component: T) -> (T, Rollback<T>) {
+pub fn make_rollback<T: Component + Default>(component: T) -> (T, Rollback<T>) {
     (component, Rollback::default())
 }
 
@@ -21,16 +14,14 @@ pub fn spawn<T: 'static + Clone + Send + Sync>(mut spawn_func: impl FnMut(In<T>,
     let mut system = move |world: &mut World| spawn_func(In(spawn_data.clone()), world);
 
     move |world: &mut World| {
-        let entity = system(world);
-        world.entity_mut(entity).insert(RollbackSpawnMarker::new(system));
+        let _entity = system(world);
     }
 }
 
 //maybe this is more ergonomic?
 pub fn spawn2(mut spawn_system: impl FnMut(&mut World) -> Entity + 'static + Send + Sync) -> impl FnOnce(&mut World) {
     move |world: &mut World| {
-        let entity = spawn_system(world);
-        world.entity_mut(entity).insert(RollbackSpawnMarker::new(spawn_system));
+        let _entity = spawn_system(world);
     }
 }
 
@@ -38,13 +29,12 @@ pub fn spawn3<M>(spawn_system: impl IntoSystem<(), Entity, M>) -> impl FnOnce(&m
     let mut spawn_system = Box::new(IntoSystem::into_system(spawn_system));
     move |world: &mut World| {
         spawn_system.initialize(world);
-        let entity = spawn_system.run((), world);
+        let _entity = spawn_system.run((), world);
         spawn_system.apply_deferred(world);
-        world.entity_mut(entity).insert(RollbackSpawnMarker(spawn_system));
     }
 }
 
-pub fn getter<T: Clone + 'static + Send + Sync>(entity: &mut EntityWorldMut) -> Option<Box<dyn RollbackStorage>> {
+pub fn getter<T: Clone + Default + 'static + Send + Sync>(entity: &mut EntityWorldMut) -> Option<Box<dyn RollbackStorage>> {    //TODO: remove Default requirement
     entity.take::<Rollback<T>>().map(|x| Box::new(x) as Box<dyn RollbackStorage>)
 }
 
@@ -124,20 +114,20 @@ impl<T> RollbackComponentConfig<T> {
         self.finish().register_component()
     }
 }
-impl<T: 'static + Send + Sync + Clone> RollbackComponentConfig<T> {
+impl<T: 'static + Send + Sync + Clone + Default> RollbackComponentConfig<T> { //TODO: remove Default requirement
     pub fn default_getter(mut self) -> Self {
         self.getter = Some(getter::<T>);
         self
     }
 }
-impl<T: Component + Clone> RollbackComponentConfig<T> {
+impl<T: Component + Clone + Default> RollbackComponentConfig<T> { //TODO: remove Default requirement
     pub fn default_systems(mut self) -> Self {
         self.restore_system = Some(restore::<T>.in_set(RollbackSet::Restore));
         self.save_system = Some(save::<T>.in_set(RollbackSet::Save));
         self
     }
 }
-impl<T: Component + Send + Sync + Clone> RollbackComponentConfig<T> {
+impl<T: Component + Send + Sync + Clone + Default> RollbackComponentConfig<T> { //TODO: remove Default requirement
     pub fn defaults(self) -> Self {
         self.default_systems().default_getter()
     }

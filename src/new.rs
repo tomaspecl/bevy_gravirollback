@@ -2,7 +2,8 @@ pub mod systems;
 pub mod for_user;
 
 use bevy::prelude::*;
-use bevy::ecs::schedule::ScheduleLabel;
+use bevy::ecs::schedule::{ScheduleLabel, SystemConfigs};
+use bevy::ecs::query::{ReadOnlyWorldQuery, WorldQuery};
 use bevy::ecs::system::BoxedSystem;
 use bevy::utils::HashMap;
 
@@ -24,9 +25,31 @@ use bevy::utils::HashMap;
 
 //TODO: component change detection should work correctly even when changing frames -> maybe use marker Component to signal change?
 
+//TODO: figure out how to remove the Default requirement for #[reflect(Resource)]
+
+/*
+Game Update loop {
+    HandleIo {
+        LocalInput,
+        Networking,
+        Merge Data/Spawn/Despawn
+    }
+
+
+    RollbackSchedule loop {
+        Restore if RestoreStates, RestoreInputs if RestoreInputs
+
+        Update,
+        Save if SaveStates,
+        DespawnNonExistent,
+    }
+    //after running the RollbackSchedule loop it should hold that current frame == last frame
+}
+*/
+
 pub struct RollbackPlugin {
     /// The [`Schedule`] in which rollback processing [`SystemSet`]s will be configured
-    pub rollback_processing_schedule: Option<bevy::utils::intern::Interned<dyn ScheduleLabel>>,
+    pub rollback_processing_schedule: Option<bevy::utils::intern::Interned<dyn ScheduleLabel>>, //TODO: is Interned needed?
 }
 impl Default for RollbackPlugin {
     fn default() -> Self {
@@ -57,35 +80,26 @@ impl Plugin for RollbackPlugin {
 
         app.configure_sets(RollbackSchedule,(
             (
-                RollbackSet::RespawnRemove,
                 (RollbackSet::Restore, RollbackSet::RestoreInputs),
                 RollbackSet::Update,
                 RollbackSet::Save,
-                RollbackSet::Despawn,
+                RollbackSet::Despawn,   //maybe Despawn can run at the same time as Save?
             ).chain(),
-            (
-                RollbackSet::RespawnRemove,
-                RollbackSet::Restore,
-            ).run_if(|snapshot: Option<Res<SnapshotToRestore>>| {
-                if let Some(snapshot) = snapshot {
-                    !snapshot.input_only
-                }else{false}
-            }),
-            RollbackSet::RestoreInputs.run_if(resource_exists::<SnapshotToRestore>()),
+            RollbackSet::Restore.run_if(resource_exists::<RestoreStates>()),
+            RollbackSet::RestoreInputs.run_if(resource_exists::<RestoreInputs>()),
         ))
         .add_systems(RollbackSchedule,(
-            (
-                systems::respawn,
-                systems::restore_remove_nonexistent,
-            ).in_set(RollbackSet::RespawnRemove),
-            apply_deferred.after(RollbackSet::RespawnRemove).before(RollbackSet::Restore),
             //RollbackSet::Restore
-            apply_deferred.after(RollbackSet::Restore).before(RollbackSet::Update),
+            systems::restore_exists_remove_nonexistent::<With<RollbackID>>.in_set(RollbackSet::Restore),
+            apply_deferred.after(RollbackSet::Restore).after(RollbackSet::RestoreInputs).before(RollbackSet::Update),
             //RollbackSet::Update
-            apply_deferred.after(RollbackSet::Update).before(RollbackSet::Save),
-            systems::save_existence.in_set(RollbackSet::Save),
+            (
+                apply_deferred,
+                |mut info: ResMut<SnapshotInfo>| info.current += 1,
+            ).after(RollbackSet::Update).before(RollbackSet::Save),
+            systems::save::<Exists>.in_set(RollbackSet::Save),
             apply_deferred.after(RollbackSet::Save).before(RollbackSet::Despawn),
-            systems::despawn.in_set(RollbackSet::Despawn),
+            systems::despawn_nonexistent.in_set(RollbackSet::Despawn),
 
             systems::update_rollback_map.in_set(RollbackSet::Save),
         ));
@@ -94,23 +108,27 @@ impl Plugin for RollbackPlugin {
             last: 0,
             current: 0,
             snapshots: vec![Snapshot { frame: 0, modified: false };SNAPSHOTS_LEN],
-        }).insert_resource(RollbackMap(HashMap::new())).insert_resource(DespawnedRollbackEntities {
-            entities: Vec::new(),
-        });
+        })
+        .insert_resource(RollbackMap(HashMap::new(), HashMap::new()))
+        ;
     }
 }
 
-#[derive(Component, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Component, Reflect, Clone, Copy, Hash, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub struct RollbackID(pub u64);
 
 pub const SNAPSHOTS_LEN: usize = 128;    //TODO: how to make this changable by the user of this library? maybe extern?
+//maybe I can wrap the whole lib in a macro and let the user instanciate it with their specified SNAPSHOTS_LEN? this would be crazy
+//maybe some configuration/compilation flag can be passed in Cargo.toml ?
 
 //TODO: use a flag to choose if the size is growable, size is fixed by default
-#[derive(Component, Resource, Clone)]
-pub struct Rollback<T>(pub [Option<T>;SNAPSHOTS_LEN]);   //this version has fixed size, it should be faster as there is no pointer dereference, question is if it matters or was it just premature optimization
-impl<T> Default for Rollback<T> {
+#[derive(Component, Resource, Reflect, Clone)]
+#[reflect(Resource)]
+pub struct Rollback<T: Default /* ideally remove this bound, it is mainly for Reflect */>(pub [T; SNAPSHOTS_LEN]);   //this version has fixed size, it should be faster as there is no pointer dereference, question is if it matters or was it just premature optimization
+impl<T: Default> Default for Rollback<T> {
     fn default() -> Self {
-        Self(std::array::from_fn(|_| None))     //this had to be done manualy because the #[derive(Default)] macro could not handle it with big SNAPSHOTS_LEN
+        Self(std::array::from_fn(|_| T::default()))     //this had to be done manualy because the #[derive(Default)] macro could not handle it with big SNAPSHOTS_LEN
     }
 }
 
@@ -120,11 +138,6 @@ impl<T> Default for Rollback<T> {
 //TODO: split this enum into two enums, one will be pub and second not pub
 #[derive(SystemSet, Hash, Debug, PartialEq, Eq, Clone)]
 pub enum RollbackSet {
-    /// Prune DespawnedRollbackEntities and other updates of the rollback states
-    //PrepareStep,    //???
-
-    /// Respawn rollback entities that were deleted and need to be restored and despawn those that should not exist
-    RespawnRemove,
     /// Restore the state of rollback entities that are needed to be restored. Restore Resources.
     Restore,
     /// Restore inputs
@@ -133,7 +146,7 @@ pub enum RollbackSet {
     Update,
     /// Save the state of rollback entities and Resources (not inputs)
     Save,
-    /// Despawn rollback entities that were marked for removal and save their state to DespawnedRollbackEntities
+    /// Despawn rollback entities that use Rollback<Exists> and have no frames with existence
     Despawn,
 }
 
@@ -153,22 +166,120 @@ pub enum RollbackProcessSet {
 #[derive(ScheduleLabel, PartialEq, Eq, Hash, Debug, Clone)]
 pub struct RollbackSchedule;
 
-#[derive(Resource)]
-pub struct DespawnedRollbackEntities {
-    entities: Vec<RollbackEntityEntry>,
+pub trait RollbackCapable: Default + Send + Sync + 'static {    //TODO: remove Default requirement
+    //type QueryItem;
+    type RestoreQuery<'a>: WorldQuery;
+    type SaveQuery<'a>: WorldQuery;
+    fn restore(&self, q: <Self::RestoreQuery<'_> as WorldQuery>::Item<'_>);
+    fn save(q: <Self::SaveQuery<'_> as WorldQuery>::Item<'_>) -> Self;
+
+    //for inserting and removing components and other init
+    //this can be used for spawning rollback entities and respawning them, and also sending them across network
+    //for example struct PlayerMarker; will have
+    //fn insert(&self, commands: Commands) spawn all the other components that are not rollback
+    fn insert(&self, _entity: Entity, _commands: &mut Commands) {unimplemented!()}
+    fn remove(_entity: Entity, _commands: &mut Commands) {unimplemented!()}
 }
 
-pub struct RollbackEntityEntry {
-    id: RollbackID,
-    spawn_system: Option<RollbackSpawnMarker>,
-    existence: Rollback<Existence>,
-    rollback_data: Vec<Box<dyn RollbackStorage>>,
+impl<T: Component + Clone + Default> RollbackCapable for T  //TODO: remove Default requirement
+//where
+//    T: NotTupleHack
+{
+    type RestoreQuery<'a> = &'a mut T;
+    type SaveQuery<'a> = &'a T;
+
+    fn restore(&self, mut q: Mut<T>) {
+        *q = self.clone();
+    }
+
+    fn save(q: &T) -> Self {
+        q.clone()
+    }
+
+    fn insert(&self, entity: Entity, commands: &mut Commands) {
+        commands.entity(entity).insert(self.clone());
+    }
+
+    fn remove(entity: Entity, commands: &mut Commands) {
+        commands.entity(entity).remove::<T>();
+    }
+}
+
+/*
+//negative impls
+//https://github.com/rust-lang/rust/issues/68318
+trait NotTupleHack {}
+impl<T> NotTupleHack for T {}
+macro_rules! tuple_hack_impl {
+    ($($T: ident),*) => { impl<$($T,)*> !NotTupleHack for ($($T,)*) {} }
+}
+macro_rules! tuple_impl {
+    ($(($T: ident, $t: ident, $s: ident)),*) => {
+        impl<$($T: Component + Clone),*> RollbackCapable3 for ($($T,)*) {
+            type QueryItem = ();
+            type RestoreQuery<'a> = ($(&'a mut $T,)*);
+
+            fn restore(&self, ($(mut $t,)*): ($(Mut<'_, $T>,)*)) {
+                let ($($s,)*) = self;
+                $(*$t = $s.clone();)*
+            }
+
+            fn insert(&self, entity: Entity, mut commands: Commands) {
+                commands.entity(entity).insert(self.clone());
+            }
+        
+            fn remove(entity: Entity, mut commands: Commands) {
+                commands.entity(entity).remove::<Self>();
+            }
+        }
+    }
+}
+use bevy_utils::all_tuples;
+all_tuples!(tuple_hack_impl, 1, 15, T);
+all_tuples!(tuple_impl, 1, 15, T, t, s);
+*/
+
+//so that the user can pick Rollback<Optiuon<T>> or Rollback<T>
+/*impl<T: RollbackCapable3> RollbackCapable3 for Option<T> {
+    type QueryItem = Option<T>;
+    type RestoreQuery<'a> = Option<T::RestoreQuery<'a>>;
+}*/
+
+//then user can do:
+//register_rollback::<T>
+//or
+//register_rollback::<Option<T>>
+
+pub trait RollbackSystems {
+    fn get_default_rollback_systems() -> SystemConfigs {
+        Self::get_default_rollback_systems_filtered::<With<RollbackID>>()
+    }
+    fn get_default_rollback_systems_option() -> SystemConfigs {
+        Self::get_default_rollback_systems_option_filtered::<With<RollbackID>>()
+    }
+    fn get_default_rollback_systems_filtered<QueryFilter: ReadOnlyWorldQuery + 'static>() -> SystemConfigs;
+    fn get_default_rollback_systems_option_filtered<QueryFilter: ReadOnlyWorldQuery + 'static>() -> SystemConfigs;
+}
+
+impl<T: RollbackCapable> RollbackSystems for T {
+    fn get_default_rollback_systems_filtered<QueryFilter: ReadOnlyWorldQuery + 'static>() -> SystemConfigs {
+        (
+            systems::restore_filter::<T, QueryFilter>.in_set(RollbackSet::Restore),
+            systems::save_filter::<T, QueryFilter>.in_set(RollbackSet::Save),
+        ).into_configs()
+    }
+    fn get_default_rollback_systems_option_filtered<QueryFilter: ReadOnlyWorldQuery + 'static>() -> SystemConfigs {
+        (
+            systems::restore_option_filter::<T, QueryFilter>.in_set(RollbackSet::Restore),
+            systems::save_option_filter::<T, QueryFilter>.in_set(RollbackSet::Save),
+        ).into_configs()
+    }
 }
 
 pub trait RollbackStorage: Send + Sync {
     fn restore(self: Box<Self>, entity_mut: &mut EntityWorldMut);  //TODO: can this be moved to RollbackRegistry?
 }
-impl<T: 'static + Clone + Send + Sync> RollbackStorage for Rollback<T> {
+impl<T: Default + 'static + Clone + Send + Sync> RollbackStorage for Rollback<T> {
     fn restore(self: Box<Self>, entity_mut: &mut EntityWorldMut) {
         entity_mut.insert(*self);
     }
@@ -181,53 +292,53 @@ pub struct RollbackRegistry {
 
 pub type Getter = fn(&mut EntityWorldMut) -> Option<Box<dyn RollbackStorage>>;
 
-#[derive(Component)]
-pub struct RollbackSpawnMarker(pub BoxedSystem<(), Entity>);   //TODO: maybe this should be made even more universal
-impl RollbackSpawnMarker {
-    pub fn new<Marker>(system: impl IntoSystem<(), Entity, Marker>) -> Self {
-        RollbackSpawnMarker(Box::new(IntoSystem::into_system(system)))
-    }
+//IDEA:
+//instead of having RollbackSpawnMarker with a system, have Event rollback functioning and
+//instead of RespawnRemove system set have Spawn system set in which spawn systems will be placed 
+//those spawn systems will accept SpawnEvent and create the needed entity
+//this will be used for spawning all entities and respawning them during rollback, it will be the same process
+
+//can use Query<..., Changed<Exists>> to run code that handles the "virtual" despawn and respawn when needed
+#[derive(Component, Reflect, Clone, Copy)]
+pub struct Exists(pub bool);
+impl Default for Exists {
+    fn default() -> Self { Exists(false) }  //TODO: maybe it should be Exists(true)
 }
 
-#[derive(Component)]
-pub struct RollbackDespawnMarker;
+#[derive(Resource, Reflect, Default)]
+#[reflect(Resource)]
+pub struct RollbackMap(pub HashMap<RollbackID, Entity>, pub HashMap<Entity, RollbackID>);
 
-#[derive(Clone, Default)]
-pub struct Existence;
+#[derive(Resource, Reflect, Default)]
+#[reflect(Resource)]
+//#[reflect(from_reflect = false)]
+pub struct RestoreStates;
 
-#[derive(Resource)]
-pub struct RollbackMap(HashMap<RollbackID, Entity>);
+#[derive(Resource, Reflect, Default)]
+#[reflect(Resource)]
+pub struct RestoreInputs;
 
-#[derive(Resource)]
-pub struct SnapshotToSave {
-    /// The index in storage where this snapshot should be stored
-    index: usize,
-    frame: u64,
-}
+#[derive(Resource, Reflect, Default)]
+#[reflect(Resource)]
+pub struct SaveStates;
 
-#[derive(Resource)]
-pub struct SnapshotToRestore {
-    /// The index in storage where this snapshot is located
-    index: usize,
-    frame: u64,
-    /// Only inputs should be restored
-    //TODO: this feels hacky, maybe put this somewhere else
-    input_only: bool,
-}
-
-#[derive(Resource)]
+#[derive(Resource, Reflect, Default)]
+#[reflect(Resource)]
 pub struct SnapshotInfo {
     /// The last frame in storage
     pub last: u64,
-    /// The currently loaded frame
+    /// The currently loaded frame, or the frame that should be restored
     pub current: u64,
     pub snapshots: Vec<Snapshot>,   //TODO: this should probably not belong to here
 }
 impl SnapshotInfo {
+    /// Compute the index in storage of the specified frame
     pub fn index(&self, frame: u64) -> usize { (frame%SNAPSHOTS_LEN as u64) as usize }  //TODO: &self is not needed now but in the future SNAPSHOTS_LEN could be part of the struct
+    /// Compute the index in storage of the current frame
+    pub fn current_index(&self) -> usize { self.index(self.current) }
 }
 
-#[derive(Clone)]
+#[derive(Reflect, Clone)]
 pub struct Snapshot {
     pub frame: u64,
     pub modified: bool,

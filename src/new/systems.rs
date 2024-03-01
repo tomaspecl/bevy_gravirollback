@@ -18,64 +18,41 @@ use bevy::prelude::*;
 // | state + process IO -> execute -> | state + process IO -> execute -> | state   ...
 // | get spawn command -> spawn entity with RollbackSpawnMarker | 
 
-pub fn respawn(world: &mut World) {
-    let index = world.resource::<SnapshotToRestore>().index;   //TODO: I should not need to check anything here, DespawnedRollbackEntities should be pruned already
-    let mut to_spawn = Vec::new();
-    world.resource_mut::<DespawnedRollbackEntities>().entities.retain_mut(|e| {
-        if e.existence.0[index].is_some() {
-            to_spawn.push(RollbackEntityEntry {
-                id: e.id,
-                spawn_system: std::mem::take(&mut e.spawn_system),
-                existence: std::mem::take(&mut e.existence),
-                rollback_data: std::mem::take(&mut e.rollback_data),
-            });
-            false
-        }else{
-            true
+//only despawn entities with Rollback<Exists> having all false, thus indicating that the entity should be removed
+pub fn despawn_nonexistent(
+    mut commands: Commands,
+    query: Query<(Entity, &Rollback<Exists>)>,
+) {
+    for (e, r) in &query {
+        //TODO: use some form of caching, like NonExistentFor(frames: usize)
+        //the cached value can be updated when a custom save<Exists> runs
+        if r.0.iter().all(|x| !x.0) {
+            commands.entity(e).despawn_recursive();
         }
-    });
-
-    world.resource_scope(|world, mut map: Mut<RollbackMap>| {
-        for e in to_spawn {
-            if e.existence.0[index].is_some() {
-                let mut system = e.spawn_system.expect("Rollback Entity marked for Despawning needs a RollbackSpawnMarker").0;
-                //system.initialize(world);   //TODO: maybe check if it was already initialized? -> maybe check how world.run_schedule() does it
-                let entity = system.run((), world);     //TODO: why does it need mutability of the system?
-                system.apply_deferred(world); //TODO: is this needed? if yes then I need to start putting this in more places
-                let _ = map.0.insert(e.id, entity);     //TODO: maybe should panic when key existed
-                let mut entity_mut = world.entity_mut(entity);
-                entity_mut.insert(RollbackSpawnMarker(system));
-                
-                for data in e.rollback_data {
-                    data.restore(&mut entity_mut);
-                }
-            }
-        }
-    });
+    }
 }
 
-pub fn despawn(world: &mut World) {
-    let entities = world.query_filtered::<Entity, With<RollbackDespawnMarker>>().iter(world).collect::<Vec<_>>();
-
-    world.resource_scope(|world2, mut despawned: Mut<DespawnedRollbackEntities>|
-        world2.resource_scope(|world, registry: Mut<RollbackRegistry>| {
-            for entity in entities {
-                let mut e = world.entity_mut(entity);
-                let id = e.take::<RollbackID>().expect("Rollback Entity marked for Despawning needs a RollbackId");
-                let spawn_system = e.take::<RollbackSpawnMarker>().expect("Rollback Entity marked for Despawning needs a RollbackSpawnMarker");
-                let existence = e.take::<Rollback<Existence>>().expect("Rollback Entity marked for Despawning needs a Rollback<Existence>");
-                let rollback_data = registry.getters.iter().filter_map(|f| f(&mut e)).collect();
-        
-                despawned.entities.push(RollbackEntityEntry {
-                    id,
-                    spawn_system: Some(spawn_system),
-                    existence,
-                    rollback_data,
-                });
-        
-                e.despawn_recursive();
+//automatically update the RollbackMap when a new RollbackID component is added or removed
+//should also work when a rollback entity gets despawned
+pub fn update_rollback_map(
+    mut map: ResMut<RollbackMap>,
+    additions: Query<(Entity, &RollbackID), Added<RollbackID>>,
+    mut removals: RemovedComponents<RollbackID>,
+) {
+    for (e,&r) in &additions {
+        if map.0.insert(r, e).is_some() || map.1.insert(e, r).is_some() {
+            panic!("Can not add rollback mapping for Entity {e:?} RollbackID {r:?} because it already existed");
+        }
+    }
+    for e in removals.read() {
+        if let Some(r) = map.1.remove(&e) {
+            if map.0.remove(&r).is_none() {
+                panic!("Entity {e:?} did not have a mapping from RollbackID {r:?}");
             }
-    }));
+        }else{
+            panic!("Entity {e:?} did not have a mapping to RollbackID");
+        }
+    }
 }
 
 //when the state should be fixed, the user could use a Query parameter to narrow down the Query
@@ -85,76 +62,118 @@ pub fn despawn(world: &mut World) {
 //}
 
 //removes all entities that should not exist in the frame which is being restored, they do not need to be saved
-//this should run before other restore<T>
-pub fn restore_remove_nonexistent(
-    index: Res<SnapshotToRestore>,
-    query: Query<(Entity, &Rollback<Existence>), With<RollbackID>>,    //TODO: is With<RollbackId> needed?
+//when an entity is restored then all future existence should be taken as false, and the entity removed
+pub fn restore_exists_remove_nonexistent<QueryFilter: ReadOnlyWorldQuery>(
+    info: Res<SnapshotInfo>,
+    mut query: Query<(Entity, &mut Exists, &Rollback<Exists>), QueryFilter>,    //TODO: use Rollback<Exists> instead of Rollback<Option<Exists>>
     mut commands: Commands,
 ) {
-    for (e, existance) in &query {
-        if existance.0[index.index].is_none() {
-            commands.entity(e).despawn_recursive();
-        }
-    }
-}
-
-//the default restore and save rollback systems, the user can use their own
-pub fn restore<T: Component + Clone>(
-    index: Res<SnapshotToRestore>,
-    mut query: Query<(Entity, Option<&mut T>,&Rollback<T>), With<RollbackID>>,    //TODO: is With<RollbackId> needed?
-    mut commands: Commands,
-) {
-    for (e, c, r) in &mut query {
-        if let Some(component) = &r.0[index.index] {
-            if let Some(mut c) = c {
-                *c = component.clone();
-            }else{
-                commands.entity(e).insert(component.clone());
+    let first = info.last.saturating_sub(SNAPSHOTS_LEN as u64 - 1);
+    'outer: for (e, mut existence, r) in &mut query {
+        let ex = r.0[info.current_index()];
+        *existence = ex;
+        if !ex.0 {
+            for i in (first..info.current).map(|frame| info.index(frame)) {
+                if r.0[i].0 {
+                    continue 'outer;    //the entity exists
+                }
             }
-        }else{
-            commands.entity(e).remove::<T>();
+            commands.entity(e).despawn_recursive(); //the entity does not exist, despawn it
         }
     }
 }
 
-pub fn save<T: Component + Clone>(
-    index: Res<SnapshotToSave>,
-    mut query: Query<(Option<&T>,&mut Rollback<T>), With<RollbackID>>,    //TODO: is With<RollbackId> needed?
+//TODO: allow using Bundles, tuples, etc... for T, example: Rollback<(Transform, Velocity)>
+//the default restore and save rollback systems, the user can use their own
+pub fn restore<T: RollbackCapable>(
+    info: Res<SnapshotInfo>,
+    query: Query<(T::RestoreQuery<'_>, &Rollback<T>), With<RollbackID>>,
 ) {
-    for (c, mut r) in &mut query {
-        r.0[index.index] = c.map(|x| x.clone());
+    restore_filter(info, query);
+}
+
+pub fn restore_option<T: RollbackCapable>(
+    info: Res<SnapshotInfo>,
+    query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), With<RollbackID>>,
+    commands: Commands,
+) {
+    restore_option_filter(info, query, commands);
+}
+
+pub fn save<T: RollbackCapable>(
+    info: Res<SnapshotInfo>,
+    query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), With<RollbackID>>,
+) {
+    save_filter(info, query);
+}
+
+pub fn save_option<T: RollbackCapable>(
+    info: Res<SnapshotInfo>,
+    query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), With<RollbackID>>,
+) {
+    save_option_filter(info, query);
+}
+
+pub fn restore_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
+    info: Res<SnapshotInfo>,
+    mut query: Query<(T::RestoreQuery<'_>, &Rollback<T>), QueryFilter>,
+) {
+    for (q, r) in &mut query {
+        r.0[info.current_index()].restore(q);
     }
 }
 
-pub fn save_existence(
-    index: Res<SnapshotToSave>,
-    mut query: Query<(Has<RollbackDespawnMarker>,&mut Rollback<Existence>), With<RollbackID>>,    //TODO: is With<RollbackId> needed?
+pub fn restore_option_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
+    info: Res<SnapshotInfo>,
+    mut query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), QueryFilter>,
+    mut commands: Commands,
 ) {
-    for (despawn, mut r) in &mut query {
-        r.0[index.index] = if despawn {None}else{Some(Existence)};
+    for (e, q, r) in &mut query {
+        match (&r.0[info.current_index()], q) {
+            (Some(to_restore), None) => to_restore.insert(e, &mut commands),
+            (Some(to_restore), Some(q)) => to_restore.restore(q),
+            (None, Some(_)) => T::remove(e, &mut commands),
+            (None, None) => (),
+        }
     }
 }
 
-//TODO: automatically update the RollbackMap when a new RollbackId component is added
-pub fn update_rollback_map(
-    mut map: ResMut<RollbackMap>,
-    query: Query<(Entity, &RollbackID), Added<RollbackID>>,
+pub fn save_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
+    info: Res<SnapshotInfo>,
+    mut query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), QueryFilter>,
 ) {
-    for (e,&r) in &query {
-        map.0.insert(r, e);
+    for (q, mut r) in &mut query {
+        r.0[info.current_index()] = T::save(q);
+    }
+}
+
+pub fn save_option_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
+    info: Res<SnapshotInfo>,
+    mut query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), QueryFilter>,
+) {
+    for (q, mut r) in &mut query {
+        r.0[info.current_index()] = q.map(T::save);
     }
 }
 
 //make the same systems for Resources
 //the user can then use arbitrary types for storing Inputs and still have rollback work for them
 
-pub fn restore_resource<T: Resource + Clone>(
-    index: Res<SnapshotToRestore>,
+pub fn restore_resource<T: Resource + Clone + Default>( //TODO: remove Default requirement
+    info: Res<SnapshotInfo>,
     rollback: Res<Rollback<T>>,
+    mut resource: ResMut<T>,
+) {
+    *resource = rollback.0[info.current_index()].clone();
+}
+
+pub fn restore_resource_option<T: Resource + Clone>(
+    info: Res<SnapshotInfo>,
+    rollback: Res<Rollback<Option<T>>>,
     resource: Option<ResMut<T>>,
     mut commands: Commands,
 ) {
-    if let Some(res) = &rollback.0[index.index] {
+    if let Some(res) = &rollback.0[info.current_index()] {
         if let Some(mut resource) = resource {
             *resource = res.clone();
         }else{
@@ -165,21 +184,29 @@ pub fn restore_resource<T: Resource + Clone>(
     }
 }
 
-pub fn save_resource<T: Resource + Clone>(
-    index: Res<SnapshotToSave>,
+pub fn save_resource<T: Resource + Clone + Default>( //TODO: remove Default requirement
+    info: Res<SnapshotInfo>,
     mut rollback: ResMut<Rollback<T>>,
-    resource: Option<ResMut<T>>,
+    resource: Res<T>,
 ) {
-    rollback.0[index.index] = resource.map(|x| x.clone());
+    rollback.0[info.current_index()] = resource.clone();
+}
+
+pub fn save_resource_option<T: Resource + Clone>(
+    info: Res<SnapshotInfo>,
+    mut rollback: ResMut<Rollback<Option<T>>>,
+    resource: Option<Res<T>>,
+) {
+    rollback.0[info.current_index()] = resource.map(|x| x.clone());
 }
 
 //more like clear_input, save_input should run after RollbackProcessSet::HandleIO
 //this should not be needed to run in RollbackSchedule because this will delete previously collected inputs
-pub fn save_resource_input<T: Resource + Clone>(
-    index: Res<SnapshotToSave>,
-    mut rollback: ResMut<Rollback<T>>,
+pub fn save_resource_input_option<T: Resource + Clone>(
+    info: Res<SnapshotInfo>,
+    mut rollback: ResMut<Rollback<Option<T>>>,
 ) {
-    rollback.0[index.index] = None;
+    rollback.0[info.current_index()] = None;
 }
 
 //inputs will be saved (or modified) outside of RollbackSchedule
@@ -196,64 +223,62 @@ pub fn run_rollback_schedule_system(world: &mut World) {
     //TODO: but when run inside Update it will only update 60x per second, but it should update as fast as possible -> fixed by window.present_mode = PresentMode::AutoNoVsync;
     let time = std::time::Instant::now();
 
-'lop: loop {
-    if time.elapsed() > std::time::Duration::from_millis(1000/60) {break 'lop}
+    'lop: loop {    //OPTIMIZATION: this loop should not start here but only after finding one modified frame, those checks do not need to be looped
+        if time.elapsed() > std::time::Duration::from_millis(1000/60) {break 'lop}  //TODO: the time here is arbitrary
 
-    let mut info = world.resource_mut::<SnapshotInfo>();
-    let last = info.last;
-    let snapshots = &mut info.snapshots;
+        let mut info = world.resource_mut::<SnapshotInfo>();
+        let last = info.last;
+        let snapshots = &mut info.snapshots;
 
-    let oldest = last.saturating_sub(SNAPSHOTS_LEN as u64 - 1);
+        let oldest = last.saturating_sub(SNAPSHOTS_LEN as u64 - 1);
 
-    let mut modified = None;
-    for frame in oldest..=last {
-        let index = (frame%SNAPSHOTS_LEN as u64) as usize;
-        if snapshots[index].modified {
-            assert!(snapshots[index].frame == frame);   //TODO: this should never be possible to fail
-            snapshots[index].modified = false;
-            modified = Some((index, snapshots[index].frame));
-            break;
+        let mut modified = None;
+        for frame in oldest..=last {
+            let index = (frame%SNAPSHOTS_LEN as u64) as usize;
+            if snapshots[index].modified {
+                assert!(snapshots[index].frame == frame);   //TODO: this should never be possible to fail
+                snapshots[index].modified = false;
+                modified = Some((index, snapshots[index].frame));
+                break;
+            }
         }
-    }
 
-    if let Some((index, frame)) = modified {
-        print!("*");
-        let next_index = (index+1)%SNAPSHOTS_LEN;
-        let next_frame = frame+1;
+        if let Some((index, frame)) = modified {
+            print!("*");
+            let next_index = (index+1)%SNAPSHOTS_LEN;
+            let next_frame = frame+1;
 
-        snapshots[next_index].frame = next_frame;
+            snapshots[next_index].frame = next_frame;
 
-        if next_frame>last {
-            snapshots[next_index].modified = false;
-            info.last = next_frame;
+            if next_frame>last {
+                snapshots[next_index].modified = false;
+                info.last = next_frame;
+                
+            }else{
+                snapshots[next_index].modified = true;
+            }
+
+            //println!("run_rollback_schedule_system frame {frame} index {index} next_index {next_index} last {} current {}",last,info.current);
             
+            if frame != info.current {
+                info.current = frame;   //the current frame will be used for restoring, TODO: also save the index?
+                world.insert_resource(RestoreStates);
+            }else{/* the frame that should be restored is already loaded */}
+            world.insert_resource(RestoreInputs);
+            world.insert_resource(SaveStates);  //the current frame will be used for restoring, but a system will increment the current frame after running RollbackSet::Update
+
+            //println!("run_rollback_schedule_system restoring frame {frame} index {index} input_only {input_only}");
+
+            world.run_schedule(RollbackSchedule);
+
+            world.remove_resource::<RestoreStates>();
+            //world.remove_resource::<RestoreInputs>();
+            //world.remove_resource::<SaveStates>();
         }else{
-            snapshots[next_index].modified = true;
+            break 'lop
         }
-
-        //println!("run_rollback_schedule_system frame {frame} index {index} next_index {next_index} last {} current {}",last,info.current);
-        
-        let input_only = frame == info.current;
-        //println!("run_rollback_schedule_system restoring frame {frame} index {index} input_only {input_only}");
-        world.insert_resource(SnapshotToRestore {
-            index,
-            frame,
-            input_only,
-        });
-
-        world.insert_resource(SnapshotToSave {
-            index: next_index,
-            frame: next_frame,
-        });
-
-        world.run_schedule(RollbackSchedule);
-
-        world.resource_mut::<SnapshotInfo>().current = next_frame;
-    }else{
-        break 'lop
+        //break 'lop  //disable the loop for now, it is not needed thanks to window.present_mode = PresentMode::AutoNoVsync; which makes the Update schedule update as fast as possible
     }
-    break 'lop  //disable the loop for now, it is not needed thanks to window.present_mode = PresentMode::AutoNoVsync; which makes the Update schedule update as fast as possible
-}
 }
 
 //TODO: default systems that will take SnapshotUpdateEvent<T> that will simplify the usage
