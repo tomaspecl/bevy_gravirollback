@@ -39,19 +39,11 @@ pub fn update_rollback_map(
     additions: Query<(Entity, &RollbackID), Added<RollbackID>>,
     mut removals: RemovedComponents<RollbackID>,
 ) {
-    for (e,&r) in &additions {
-        if map.0.insert(r, e).is_some() || map.1.insert(e, r).is_some() {
-            panic!("Can not add rollback mapping for Entity {e:?} RollbackID {r:?} because it already existed");
-        }
-    }
     for e in removals.read() {
-        if let Some(r) = map.1.remove(&e) {
-            if map.0.remove(&r).is_none() {
-                panic!("Entity {e:?} did not have a mapping from RollbackID {r:?}");
-            }
-        }else{
-            panic!("Entity {e:?} did not have a mapping to RollbackID");
-        }
+        map.remove(e);
+    }
+    for (e,&r) in &additions {
+        map.insert(e,r);
     }
 }
 
@@ -65,7 +57,8 @@ pub fn update_rollback_map(
 //when an entity is restored then all future existence should be taken as false, and the entity removed
 pub fn restore_exists_remove_nonexistent<QueryFilter: ReadOnlyWorldQuery>(
     info: Res<SnapshotInfo>,
-    mut query: Query<(Entity, &mut Exists, &Rollback<Exists>), QueryFilter>,    //TODO: use Rollback<Exists> instead of Rollback<Option<Exists>>
+    mut map: ResMut<RollbackMap>,
+    mut query: Query<(Entity, &mut Exists, &Rollback<Exists>), QueryFilter>,
     mut commands: Commands,
 ) {
     let first = info.last.saturating_sub(SNAPSHOTS_LEN as u64 - 1);
@@ -73,11 +66,14 @@ pub fn restore_exists_remove_nonexistent<QueryFilter: ReadOnlyWorldQuery>(
         let ex = r.0[info.current_index()];
         *existence = ex;
         if !ex.0 {
+            println!("checking despawning entity {e:?}");
             for i in (first..info.current).map(|frame| info.index(frame)) {
                 if r.0[i].0 {
                     continue 'outer;    //the entity exists
                 }
             }
+            println!("despawning entity {e:?}");
+            map.remove(e);
             commands.entity(e).despawn_recursive(); //the entity does not exist, despawn it
         }
     }
@@ -88,50 +84,56 @@ pub fn restore_exists_remove_nonexistent<QueryFilter: ReadOnlyWorldQuery>(
 pub fn restore<T: RollbackCapable>(
     info: Res<SnapshotInfo>,
     query: Query<(T::RestoreQuery<'_>, &Rollback<T>), With<RollbackID>>,
+    extra: StaticSystemParam<T::RestoreExtraParam>,
 ) {
-    restore_filter(info, query);
+    restore_filter(info, query, extra);
 }
 
 pub fn restore_option<T: RollbackCapable>(
     info: Res<SnapshotInfo>,
     query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), With<RollbackID>>,
+    extra: StaticSystemParam<T::RestoreExtraParam>,
     commands: Commands,
 ) {
-    restore_option_filter(info, query, commands);
+    restore_option_filter(info, query, extra, commands);
 }
 
 pub fn save<T: RollbackCapable>(
     info: Res<SnapshotInfo>,
     query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), With<RollbackID>>,
+    extra: StaticSystemParam<T::SaveExtraParam>,
 ) {
-    save_filter(info, query);
+    save_filter(info, query, extra);
 }
 
 pub fn save_option<T: RollbackCapable>(
     info: Res<SnapshotInfo>,
     query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), With<RollbackID>>,
+    extra: StaticSystemParam<T::SaveExtraParam>,
 ) {
-    save_option_filter(info, query);
+    save_option_filter(info, query, extra);
 }
 
 pub fn restore_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
     info: Res<SnapshotInfo>,
     mut query: Query<(T::RestoreQuery<'_>, &Rollback<T>), QueryFilter>,
+    mut extra: StaticSystemParam<T::RestoreExtraParam>,
 ) {
     for (q, r) in &mut query {
-        r.0[info.current_index()].restore(q);
+        r.0[info.current_index()].restore(q, &mut extra);
     }
 }
 
 pub fn restore_option_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
     info: Res<SnapshotInfo>,
     mut query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), QueryFilter>,
+    mut extra: StaticSystemParam<T::RestoreExtraParam>,
     mut commands: Commands,
 ) {
     for (e, q, r) in &mut query {
         match (&r.0[info.current_index()], q) {
             (Some(to_restore), None) => to_restore.insert(e, &mut commands),
-            (Some(to_restore), Some(q)) => to_restore.restore(q),
+            (Some(to_restore), Some(q)) => to_restore.restore(q, &mut extra),
             (None, Some(_)) => T::remove(e, &mut commands),
             (None, None) => (),
         }
@@ -141,18 +143,20 @@ pub fn restore_option_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery
 pub fn save_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
     info: Res<SnapshotInfo>,
     mut query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), QueryFilter>,
+    mut extra: StaticSystemParam<T::SaveExtraParam>,
 ) {
     for (q, mut r) in &mut query {
-        r.0[info.current_index()] = T::save(q);
+        r.0[info.current_index()] = T::save(q, &mut extra);
     }
 }
 
 pub fn save_option_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
     info: Res<SnapshotInfo>,
     mut query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), QueryFilter>,
+    mut extra: StaticSystemParam<T::SaveExtraParam>,
 ) {
     for (q, mut r) in &mut query {
-        r.0[info.current_index()] = q.map(T::save);
+        r.0[info.current_index()] = q.map(|q | T::save(q, &mut extra));
     }
 }
 
@@ -224,7 +228,7 @@ pub fn run_rollback_schedule_system(world: &mut World) {
     let time = std::time::Instant::now();
 
     'lop: loop {    //OPTIMIZATION: this loop should not start here but only after finding one modified frame, those checks do not need to be looped
-        if time.elapsed() > std::time::Duration::from_millis(1000/60) {break 'lop}  //TODO: the time here is arbitrary
+        //if time.elapsed() > std::time::Duration::from_millis(1000/60) {break 'lop}  //TODO: the time here is arbitrary
 
         let mut info = world.resource_mut::<SnapshotInfo>();
         let last = info.last;
@@ -244,13 +248,13 @@ pub fn run_rollback_schedule_system(world: &mut World) {
         }
 
         if let Some((index, frame)) = modified {
-            print!("*");
+            //print!("*");
             let next_index = (index+1)%SNAPSHOTS_LEN;
             let next_frame = frame+1;
 
             snapshots[next_index].frame = next_frame;
 
-            if next_frame>last {
+            if next_frame>=last {
                 snapshots[next_index].modified = false;
                 info.last = next_frame;
                 
@@ -278,6 +282,10 @@ pub fn run_rollback_schedule_system(world: &mut World) {
             break 'lop
         }
         //break 'lop  //disable the loop for now, it is not needed thanks to window.present_mode = PresentMode::AutoNoVsync; which makes the Update schedule update as fast as possible
+    }
+    let elapsed = time.elapsed().as_secs_f32();
+    if elapsed > 0.01 {
+        println!("run_rollback_schedule_system elapsed {elapsed}");
     }
 }
 

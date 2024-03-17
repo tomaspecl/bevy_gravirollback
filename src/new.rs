@@ -4,7 +4,7 @@ pub mod for_user;
 use bevy::prelude::*;
 use bevy::ecs::schedule::{ScheduleLabel, SystemConfigs};
 use bevy::ecs::query::{ReadOnlyWorldQuery, WorldQuery};
-use bevy::ecs::system::BoxedSystem;
+use bevy::ecs::system::{StaticSystemParam, SystemParam, SystemParamItem};
 use bevy::utils::HashMap;
 
 // *****************************
@@ -90,18 +90,31 @@ impl Plugin for RollbackPlugin {
         ))
         .add_systems(RollbackSchedule,(
             //RollbackSet::Restore
-            systems::restore_exists_remove_nonexistent::<With<RollbackID>>.in_set(RollbackSet::Restore),
+            (
+                systems::restore_exists_remove_nonexistent::<With<RollbackID>>,
+                //systems::update_rollback_map,
+            ).chain().in_set(RollbackSet::Restore),
+
             apply_deferred.after(RollbackSet::Restore).after(RollbackSet::RestoreInputs).before(RollbackSet::Update),
+            
             //RollbackSet::Update
+
             (
                 apply_deferred,
                 |mut info: ResMut<SnapshotInfo>| info.current += 1,
             ).after(RollbackSet::Update).before(RollbackSet::Save),
-            systems::save::<Exists>.in_set(RollbackSet::Save),
-            apply_deferred.after(RollbackSet::Save).before(RollbackSet::Despawn),
-            systems::despawn_nonexistent.in_set(RollbackSet::Despawn),
 
-            systems::update_rollback_map.in_set(RollbackSet::Save),
+            //RollbackSet::Save
+            systems::save::<Exists>.in_set(RollbackSet::Save),
+
+            apply_deferred.after(RollbackSet::Save).before(RollbackSet::Despawn),
+
+            //RollbackSet::Despawn
+            systems::despawn_nonexistent.in_set(RollbackSet::Despawn),
+            (
+                apply_deferred,
+                systems::update_rollback_map,
+            ).chain().after(RollbackSet::Despawn)
         ));
 
         app.insert_resource(SnapshotInfo {
@@ -167,11 +180,14 @@ pub enum RollbackProcessSet {
 pub struct RollbackSchedule;
 
 pub trait RollbackCapable: Default + Send + Sync + 'static {    //TODO: remove Default requirement
-    //type QueryItem;
     type RestoreQuery<'a>: WorldQuery;
+    /// Extra restore system parameters that can be used for anything
+    type RestoreExtraParam: SystemParam;
     type SaveQuery<'a>: WorldQuery;
-    fn restore(&self, q: <Self::RestoreQuery<'_> as WorldQuery>::Item<'_>);
-    fn save(q: <Self::SaveQuery<'_> as WorldQuery>::Item<'_>) -> Self;
+    // Extra save system parameters that can be used for anything
+    type SaveExtraParam: SystemParam;
+    fn restore(&self, q: <Self::RestoreQuery<'_> as WorldQuery>::Item<'_>, extra: &mut StaticSystemParam<Self::RestoreExtraParam>);
+    fn save(q: <Self::SaveQuery<'_> as WorldQuery>::Item<'_>, extra: &mut StaticSystemParam<Self::SaveExtraParam>) -> Self;
 
     //for inserting and removing components and other init
     //this can be used for spawning rollback entities and respawning them, and also sending them across network
@@ -186,13 +202,15 @@ impl<T: Component + Clone + Default> RollbackCapable for T  //TODO: remove Defau
 //    T: NotTupleHack
 {
     type RestoreQuery<'a> = &'a mut T;
+    type RestoreExtraParam = ();
     type SaveQuery<'a> = &'a T;
+    type SaveExtraParam = ();
 
-    fn restore(&self, mut q: Mut<T>) {
+    fn restore(&self, mut q: Mut<T>, _extra: &mut StaticSystemParam<()>) {
         *q = self.clone();
     }
 
-    fn save(q: &T) -> Self {
+    fn save(q: &T, _extra: &mut StaticSystemParam<()>) -> Self {
         q.clone()
     }
 
@@ -307,7 +325,39 @@ impl Default for Exists {
 
 #[derive(Resource, Reflect, Default)]
 #[reflect(Resource)]
-pub struct RollbackMap(pub HashMap<RollbackID, Entity>, pub HashMap<Entity, RollbackID>);
+pub struct RollbackMap(pub HashMap<RollbackID, Entity>, pub HashMap<Entity, RollbackID>);   //TODO: this should be generic over RollbackID
+impl RollbackMap {
+    pub fn remove(&mut self, e: Entity) {
+        if let Some(r) = self.1.get(&e) {
+            if let Some(e2) = self.0.get(r) {
+                if *e2!=e {
+                    panic!("Entity {e:?} RollbackID {r:?} had mapping to Entity {e2:?}");
+                }
+                self.0.remove(r);
+                self.1.remove(&e);
+            }else{
+                panic!("Entity {e:?} did not have a mapping from RollbackID {r:?}");
+            }
+        }else{
+            warn!("Entity {e:?} did not have a mapping to RollbackID");
+        }
+    }
+    pub fn insert(&mut self, e: Entity, r: RollbackID) {
+        match (self.0.get(&r), self.1.get(&e)) {
+            (None, None) => {
+                self.0.insert(r, e);
+                self.1.insert(e, r);
+            },
+            (Some(e2), Some(r2)) => {
+                if *e2!=e || *r2!=r {
+                    panic!("Can not add rollback mapping for Entity {e:?} RollbackID {r:?} because {e2:?}, {r2:?} already existed");
+                }
+            },
+            (Some(e2), None) => panic!("RollbackMap was incomplete Entity {e2:?} (insert with {e:?}, {r:?})"),
+            (None, Some(r2)) => panic!("RollbackMap was incomplete RollbackID {r2:?} (insert with {e:?}, {r:?})"),
+        }
+    }
+}
 
 #[derive(Resource, Reflect, Default)]
 #[reflect(Resource)]
