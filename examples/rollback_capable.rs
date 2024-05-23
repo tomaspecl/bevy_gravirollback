@@ -5,6 +5,7 @@ use bevy_gravirollback::new::*;
 use bevy_gravirollback::new::for_user::*;
 
 use bevy::prelude::*;
+use bevy::ecs::system::StaticSystemParam;
 
 /// Imagine that you have a point going in a circle and that movement is based on a parameter.
 /// Then it is not needed to do [`Rollback`] on the whole [`Transform`] but only on that parameter.
@@ -20,16 +21,18 @@ struct Parameter(f32);
 
 impl RollbackCapable for Parameter {
     type RestoreQuery<'a> = (&'a mut Transform, &'a mut Parameter);
+    type RestoreExtraParam<'a> = ();
     type SaveQuery<'a> = &'a Parameter;
+    type SaveExtraParam<'a> = ();
 
-    fn restore(&self, mut q: (Mut<Transform>, Mut<Parameter>)) {
+    fn restore(&self, mut q: (Mut<Transform>, Mut<Parameter>), _extra: &mut StaticSystemParam<()>) {
         //update the `Transform`
         let pos = &mut q.0.translation;
         (pos.y, pos.x) = self.0.sin_cos();
         //update the `Parameter`
         q.1.0 = self.0;
     }
-    fn save(q: &Parameter) -> Self {
+    fn save(q: &Parameter, _extra: &mut StaticSystemParam<()>) -> Self {
         Parameter(q.0)
     }
 }

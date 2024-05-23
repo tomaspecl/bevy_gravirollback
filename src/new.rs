@@ -3,7 +3,7 @@ pub mod for_user;
 
 use bevy::prelude::*;
 use bevy::ecs::schedule::{ScheduleLabel, SystemConfigs};
-use bevy::ecs::query::{ReadOnlyWorldQuery, WorldQuery};
+use bevy::ecs::query::{WorldQuery, QueryData, QueryFilter};
 use bevy::ecs::system::{StaticSystemParam, SystemParam, SystemParamItem};
 use bevy::utils::HashMap;
 
@@ -85,13 +85,13 @@ impl Plugin for RollbackPlugin {
                 RollbackSet::Save,
                 RollbackSet::Despawn,   //maybe Despawn can run at the same time as Save?
             ).chain(),
-            RollbackSet::Restore.run_if(resource_exists::<RestoreStates>()),
-            RollbackSet::RestoreInputs.run_if(resource_exists::<RestoreInputs>()),
+            RollbackSet::Restore.run_if(resource_exists::<RestoreStates>),
+            RollbackSet::RestoreInputs.run_if(resource_exists::<RestoreInputs>),
         ))
         .add_systems(RollbackSchedule,(
             //RollbackSet::Restore
             (
-                systems::restore_exists_remove_nonexistent::<With<RollbackID>>,
+                systems::restore_exists_remove_nonexistent::<systems::DefaultFilter>,
                 //systems::update_rollback_map,
             ).chain().in_set(RollbackSet::Restore),
 
@@ -180,14 +180,14 @@ pub enum RollbackProcessSet {
 pub struct RollbackSchedule;
 
 pub trait RollbackCapable: Default + Send + Sync + 'static {    //TODO: remove Default requirement
-    type RestoreQuery<'a>: WorldQuery;
+    type RestoreQuery<'a>: QueryData;
     /// Extra restore system parameters that can be used for anything
-    type RestoreExtraParam: SystemParam;
-    type SaveQuery<'a>: WorldQuery;
-    // Extra save system parameters that can be used for anything
-    type SaveExtraParam: SystemParam;
-    fn restore(&self, q: <Self::RestoreQuery<'_> as WorldQuery>::Item<'_>, extra: &mut StaticSystemParam<Self::RestoreExtraParam>);
-    fn save(q: <Self::SaveQuery<'_> as WorldQuery>::Item<'_>, extra: &mut StaticSystemParam<Self::SaveExtraParam>) -> Self;
+    type RestoreExtraParam<'a>: SystemParam;
+    type SaveQuery<'a>: QueryData;
+    /// Extra save system parameters that can be used for anything
+    type SaveExtraParam<'a>: SystemParam;
+    fn restore(&self, q: <Self::RestoreQuery<'_> as WorldQuery>::Item<'_>, extra: &mut StaticSystemParam<Self::RestoreExtraParam<'_>>);
+    fn save(q: <Self::SaveQuery<'_> as WorldQuery>::Item<'_>, extra: &mut StaticSystemParam<Self::SaveExtraParam<'_>>) -> Self;
 
     //for inserting and removing components and other init
     //this can be used for spawning rollback entities and respawning them, and also sending them across network
@@ -202,9 +202,9 @@ impl<T: Component + Clone + Default> RollbackCapable for T  //TODO: remove Defau
 //    T: NotTupleHack
 {
     type RestoreQuery<'a> = &'a mut T;
-    type RestoreExtraParam = ();
+    type RestoreExtraParam<'a> = ();
     type SaveQuery<'a> = &'a T;
-    type SaveExtraParam = ();
+    type SaveExtraParam<'a> = ();
 
     fn restore(&self, mut q: Mut<T>, _extra: &mut StaticSystemParam<()>) {
         *q = self.clone();
@@ -275,21 +275,21 @@ pub trait RollbackSystems {
     fn get_default_rollback_systems_option() -> SystemConfigs {
         Self::get_default_rollback_systems_option_filtered::<With<RollbackID>>()
     }
-    fn get_default_rollback_systems_filtered<QueryFilter: ReadOnlyWorldQuery + 'static>() -> SystemConfigs;
-    fn get_default_rollback_systems_option_filtered<QueryFilter: ReadOnlyWorldQuery + 'static>() -> SystemConfigs;
+    fn get_default_rollback_systems_filtered<F: QueryFilter + 'static>() -> SystemConfigs;
+    fn get_default_rollback_systems_option_filtered<F: QueryFilter + 'static>() -> SystemConfigs;
 }
 
 impl<T: RollbackCapable> RollbackSystems for T {
-    fn get_default_rollback_systems_filtered<QueryFilter: ReadOnlyWorldQuery + 'static>() -> SystemConfigs {
+    fn get_default_rollback_systems_filtered<F: QueryFilter + 'static>() -> SystemConfigs {
         (
-            systems::restore_filter::<T, QueryFilter>.in_set(RollbackSet::Restore),
-            systems::save_filter::<T, QueryFilter>.in_set(RollbackSet::Save),
+            systems::restore_filter::<T, F>.in_set(RollbackSet::Restore),
+            systems::save_filter::<T, F>.in_set(RollbackSet::Save),
         ).into_configs()
     }
-    fn get_default_rollback_systems_option_filtered<QueryFilter: ReadOnlyWorldQuery + 'static>() -> SystemConfigs {
+    fn get_default_rollback_systems_option_filtered<F: QueryFilter + 'static>() -> SystemConfigs {
         (
-            systems::restore_option_filter::<T, QueryFilter>.in_set(RollbackSet::Restore),
-            systems::save_option_filter::<T, QueryFilter>.in_set(RollbackSet::Save),
+            systems::restore_option_filter::<T, F>.in_set(RollbackSet::Restore),
+            systems::save_option_filter::<T, F>.in_set(RollbackSet::Save),
         ).into_configs()
     }
 }
@@ -328,6 +328,8 @@ impl Default for Exists {
 pub struct RollbackMap(pub HashMap<RollbackID, Entity>, pub HashMap<Entity, RollbackID>);   //TODO: this should be generic over RollbackID
 impl RollbackMap {
     pub fn remove(&mut self, e: Entity) {
+        self.print();
+        println!("Removing from RollbackMap {e:?}");
         if let Some(r) = self.1.get(&e) {
             if let Some(e2) = self.0.get(r) {
                 if *e2!=e {
@@ -341,21 +343,47 @@ impl RollbackMap {
         }else{
             warn!("Entity {e:?} did not have a mapping to RollbackID");
         }
+        self.print();
     }
     pub fn insert(&mut self, e: Entity, r: RollbackID) {
+        self.print();
+        println!("Adding to RollbackMap {e:?} {r:?}");
         match (self.0.get(&r), self.1.get(&e)) {
             (None, None) => {
                 self.0.insert(r, e);
                 self.1.insert(e, r);
             },
             (Some(e2), Some(r2)) => {
-                if *e2!=e || *r2!=r {
+                //if *e2!=e || *r2!=r {
                     panic!("Can not add rollback mapping for Entity {e:?} RollbackID {r:?} because {e2:?}, {r2:?} already existed");
-                }
+                //}
             },
+            //TODO: these are misleading, e2 has a RollbackID with it, so its not incomplete but (e2, RollbackID for e2) entry already exists
             (Some(e2), None) => panic!("RollbackMap was incomplete Entity {e2:?} (insert with {e:?}, {r:?})"),
             (None, Some(r2)) => panic!("RollbackMap was incomplete RollbackID {r2:?} (insert with {e:?}, {r:?})"),
         }
+        self.print();
+    }
+    pub fn print(&self) {
+        //*
+        let mut tmp = self.1.clone();
+        let x = self.0.iter().map(|(r,e)| (r.clone(),e.clone(),tmp.remove(e))).collect::<Vec<(RollbackID, Entity, Option<RollbackID>)>>();
+        println!("\tRollbackMap:");
+        for (r,e,r2) in x {
+            if let Some(r2) = r2 {
+                if r==r2 {
+                    println!("\tRollbackID {r:?} <=> Entity {e:?}");
+                }else{
+                    println!("\tRollbackID {r:?} -> Entity {e:?} -> {r2:?}");
+                }
+            }else{
+                println!("\tRollbackID {r:?} -> Entity {e:?}");
+            }
+        }
+        for (e,r) in tmp {
+            println!("\tRollbackID {r:?} <- Entity {e:?}");
+        }
+        // */
     }
 }
 

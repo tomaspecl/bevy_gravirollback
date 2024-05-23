@@ -49,16 +49,16 @@ pub fn update_rollback_map(
 
 //when the state should be fixed, the user could use a Query parameter to narrow down the Query
 // Query<(something),user_supplied_filter>
-//fn save<T: Component, Filter: bevy::ecs::query::ReadOnlyWorldQuery = ()>(mut q: Query<(Entity, &Rollback<T>, &mut T), Filter>) {
+//fn save<T: Component, Filter: bevy::ecs::query::QueryFilter = ()>(mut q: Query<(Entity, &Rollback<T>, &mut T), Filter>) {
 //    //TODO:
 //}
 
 //removes all entities that should not exist in the frame which is being restored, they do not need to be saved
 //when an entity is restored then all future existence should be taken as false, and the entity removed
-pub fn restore_exists_remove_nonexistent<QueryFilter: ReadOnlyWorldQuery>(
+pub fn restore_exists_remove_nonexistent<Filter: QueryFilter>(
     info: Res<SnapshotInfo>,
     mut map: ResMut<RollbackMap>,
-    mut query: Query<(Entity, &mut Exists, &Rollback<Exists>), QueryFilter>,
+    mut query: Query<(Entity, &mut Exists, &Rollback<Exists>), Filter>,
     mut commands: Commands,
 ) {
     let first = info.last.saturating_sub(SNAPSHOTS_LEN as u64 - 1);
@@ -73,26 +73,28 @@ pub fn restore_exists_remove_nonexistent<QueryFilter: ReadOnlyWorldQuery>(
                 }
             }
             println!("despawning entity {e:?}");
-            map.remove(e);
+            //map.remove(e);
             commands.entity(e).despawn_recursive(); //the entity does not exist, despawn it
         }
     }
 }
 
+pub(crate) type DefaultFilter = ();    //With<RollbackID>;
+
 //TODO: allow using Bundles, tuples, etc... for T, example: Rollback<(Transform, Velocity)>
 //the default restore and save rollback systems, the user can use their own
 pub fn restore<T: RollbackCapable>(
     info: Res<SnapshotInfo>,
-    query: Query<(T::RestoreQuery<'_>, &Rollback<T>), With<RollbackID>>,
-    extra: StaticSystemParam<T::RestoreExtraParam>,
+    query: Query<(T::RestoreQuery<'_>, &Rollback<T>), DefaultFilter>,
+    extra: StaticSystemParam<T::RestoreExtraParam<'_>>,
 ) {
     restore_filter(info, query, extra);
 }
 
 pub fn restore_option<T: RollbackCapable>(
     info: Res<SnapshotInfo>,
-    query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), With<RollbackID>>,
-    extra: StaticSystemParam<T::RestoreExtraParam>,
+    query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), DefaultFilter>,
+    extra: StaticSystemParam<T::RestoreExtraParam<'_>>,
     commands: Commands,
 ) {
     restore_option_filter(info, query, extra, commands);
@@ -100,34 +102,34 @@ pub fn restore_option<T: RollbackCapable>(
 
 pub fn save<T: RollbackCapable>(
     info: Res<SnapshotInfo>,
-    query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), With<RollbackID>>,
-    extra: StaticSystemParam<T::SaveExtraParam>,
+    query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), DefaultFilter>,
+    extra: StaticSystemParam<T::SaveExtraParam<'_>>,
 ) {
     save_filter(info, query, extra);
 }
 
 pub fn save_option<T: RollbackCapable>(
     info: Res<SnapshotInfo>,
-    query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), With<RollbackID>>,
-    extra: StaticSystemParam<T::SaveExtraParam>,
+    query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), DefaultFilter>,
+    extra: StaticSystemParam<T::SaveExtraParam<'_>>,
 ) {
     save_option_filter(info, query, extra);
 }
 
-pub fn restore_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
+pub fn restore_filter<T: RollbackCapable, Filter: QueryFilter>(
     info: Res<SnapshotInfo>,
-    mut query: Query<(T::RestoreQuery<'_>, &Rollback<T>), QueryFilter>,
-    mut extra: StaticSystemParam<T::RestoreExtraParam>,
+    mut query: Query<(T::RestoreQuery<'_>, &Rollback<T>), Filter>,
+    mut extra: StaticSystemParam<T::RestoreExtraParam<'_>>,
 ) {
     for (q, r) in &mut query {
         r.0[info.current_index()].restore(q, &mut extra);
     }
 }
 
-pub fn restore_option_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
+pub fn restore_option_filter<T: RollbackCapable, Filter: QueryFilter>(
     info: Res<SnapshotInfo>,
-    mut query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), QueryFilter>,
-    mut extra: StaticSystemParam<T::RestoreExtraParam>,
+    mut query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), Filter>,
+    mut extra: StaticSystemParam<T::RestoreExtraParam<'_>>,
     mut commands: Commands,
 ) {
     for (e, q, r) in &mut query {
@@ -140,20 +142,20 @@ pub fn restore_option_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery
     }
 }
 
-pub fn save_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
+pub fn save_filter<T: RollbackCapable, Filter: QueryFilter>(
     info: Res<SnapshotInfo>,
-    mut query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), QueryFilter>,
-    mut extra: StaticSystemParam<T::SaveExtraParam>,
+    mut query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), Filter>,
+    mut extra: StaticSystemParam<T::SaveExtraParam<'_>>,
 ) {
     for (q, mut r) in &mut query {
         r.0[info.current_index()] = T::save(q, &mut extra);
     }
 }
 
-pub fn save_option_filter<T: RollbackCapable, QueryFilter: ReadOnlyWorldQuery>(
+pub fn save_option_filter<T: RollbackCapable, Filter: QueryFilter>(
     info: Res<SnapshotInfo>,
-    mut query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), QueryFilter>,
-    mut extra: StaticSystemParam<T::SaveExtraParam>,
+    mut query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), Filter>,
+    mut extra: StaticSystemParam<T::SaveExtraParam<'_>>,
 ) {
     for (q, mut r) in &mut query {
         r.0[info.current_index()] = q.map(|q | T::save(q, &mut extra));
