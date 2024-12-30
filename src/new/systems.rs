@@ -256,10 +256,16 @@ pub fn run_rollback_schedule_system(world: &mut World) {
 
             snapshots[next_index].frame = next_frame;
 
-            if next_frame>=last {
+            if next_frame>last {
+                //new update is supposed to happen
+                //TODO: perhaps this update should be signaled by different means to eliminate bugs
+                //that are caused by accidentally setting the last snapshot's modified=false
+                //we are creating a new frame/snapshot, by default it should have modified=false
                 snapshots[next_index].modified = false;
                 info.last = next_frame;
-                
+            }else if next_frame==last {
+                //do not set modified to true as that would cause an update even if it should not happen
+                //also do not set it to false as that would make an update not happen if it was scheduled to happen but previous state got restored
             }else{
                 snapshots[next_index].modified = true;
             }
