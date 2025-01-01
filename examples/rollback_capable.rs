@@ -1,8 +1,6 @@
 //this example is partial
 
-use bevy_gravirollback::new::systems::*;
-use bevy_gravirollback::new::*;
-use bevy_gravirollback::new::for_user::*;
+use bevy_gravirollback::systems::*;
 
 use bevy::prelude::*;
 use bevy::ecs::system::StaticSystemParam;

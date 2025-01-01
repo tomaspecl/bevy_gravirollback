@@ -1,6 +1,8 @@
-use bevy_gravirollback::new::systems::*;
-use bevy_gravirollback::new::*;
-use bevy_gravirollback::new::for_user::*;
+use bevy_gravirollback::systems::*;
+use bevy_gravirollback::*;
+use bevy_gravirollback::for_user::*;
+use bevy_gravirollback::schedule_plugin::*;
+use bevy_gravirollback::existence_plugin::*;
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -36,7 +38,9 @@ fn main() {
     app.add_plugins((
         DefaultPlugins,
         WorldInspectorPlugin::new(),
-        RollbackPlugin::default(),
+        RollbackPlugin,
+        RollbackSchedulePlugin::default(),
+        ExistencePlugin,
     ))
 
     //TODO: these should be probably automaticaly registered
@@ -53,7 +57,7 @@ fn main() {
     .register_type::<Rollback<Transform>>()
 
     .insert_resource(AmbientLight {
-        color: Color::rgb(1.0,1.0,1.0),
+        color: Color::srgb(1.0,1.0,1.0),
         brightness: 0.2,
     })
     .insert_resource(ClearColor(Color::default()))
@@ -99,15 +103,15 @@ fn setup(
 ) {
     window.single_mut().present_mode = PresentMode::AutoNoVsync;
 
-    commands.spawn(Camera3dBundle {
-        transform: Transform::from_xyz(0.0, 0.0, 30.0),
-        ..default()
-    });
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 0.0, 30.0)
+    ));
     println!("running setup");
     let id = RollbackID(0);     //I should make sure its unique
     //commands.add(spawn(spawn_ball, (Transform::from_xyz(0.0, 10.0, 0.0), id)));
     //commands.add(spawn2(|world| spawn_ball2(Transform::from_xyz(0.0, 10.0, 0.0), id, world)));
-    commands.add(spawn3(spawn_ball3(Transform::from_xyz(0.0, 10.0, 0.0), id)));
+    commands.queue(spawn3(spawn_ball3(Transform::from_xyz(0.0, 10.0, 0.0), id)));
     
     /*
     let t = Transform::default();
@@ -144,14 +148,11 @@ fn spawn_ball(In((transform, id)): In<(Transform, RollbackID)>, world: &mut Worl
 
 fn spawn_ball2(transform: Transform, id: RollbackID, world: &mut World) -> Entity {
     let mut assets = world.resource_mut::<Assets<Mesh>>();
-    let mesh = assets.add(Mesh::try_from(shape::Icosphere::default()).unwrap());
+    let mesh = assets.add(Sphere::default());
 
     println!("spawning ball");
 
-    world.spawn(PbrBundle {
-        mesh,
-        ..default()
-    }).insert((
+    world.spawn(Mesh3d(mesh)).insert((
         BallMarker,
         id,
         Rollback::<Exists>::default(),
@@ -161,14 +162,11 @@ fn spawn_ball2(transform: Transform, id: RollbackID, world: &mut World) -> Entit
 
 fn spawn_ball3(transform: Transform, id: RollbackID) -> impl Fn(Commands, ResMut<Assets<Mesh>>) -> Entity {
     move |mut commands, mut assets| {
-        let mesh = assets.add(Mesh::try_from(shape::Icosphere::default()).unwrap());
+        let mesh = assets.add(Sphere::default());
 
         println!("spawning ball");
 
-        commands.spawn(PbrBundle {
-            mesh,
-            ..default()
-        }).insert((
+        commands.spawn(Mesh3d(mesh)).insert((
             BallMarker,
             id,
             make_rollback(Exists(true)),

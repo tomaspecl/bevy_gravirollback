@@ -1,83 +1,135 @@
-use super::*;
-
 use bevy::prelude::*;
+use bevy::ecs::query::{WorldQuery, QueryData, QueryFilter};
+use bevy::ecs::schedule::SystemConfigs;
+use bevy::ecs::system::{StaticSystemParam, SystemParam, SystemParamItem};
 
-//when the entity is despawned, its snapshot storage will be moved into DeletedStorage
-//and when it is needed to restore this deleted entity it will be used. When the frames of
-//a deleted entity are completely empty (all the frames have the entity removed), it will be deleted from DeletedStorage.
-//this will use RollbackDespawnMarker
+use crate::*;
+use crate::schedule_plugin::*;
 
-//if going back in time and a certain entity does not exist at that time, it can be safely deleted completely
-//as it will be respawned by the same method it was created before the time shift
+pub trait RollbackCapable: Default + Send + Sync + 'static {    //TODO: remove Default requirement
+    type RestoreQuery<'a>: QueryData;
+    /// Extra restore system parameters that can be used for anything
+    type RestoreExtraParam<'a>: SystemParam;
+    type SaveQuery<'a>: QueryData;
+    /// Extra save system parameters that can be used for anything
+    type SaveExtraParam<'a>: SystemParam;
+    fn restore(&self, q: <Self::RestoreQuery<'_> as WorldQuery>::Item<'_>, extra: &mut StaticSystemParam<Self::RestoreExtraParam<'_>>);
+    fn save(q: <Self::SaveQuery<'_> as WorldQuery>::Item<'_>, extra: &mut StaticSystemParam<Self::SaveExtraParam<'_>>) -> Self;
 
-//whenever a rollback entity is created the creation procedure should be saved (perhaps as an Input)
-//such that it can be restored at any time when needed.
-//this will use RollbackSpawnMarker(spawn_system_callback)
+    //for inserting and removing components and other init
+    //this can be used for spawning rollback entities and respawning them, and also sending them across network
+    //for example struct PlayerMarker; will have
+    //fn insert(&self, commands: Commands) spawn all the other components that are not rollback
+    fn insert(&self, _entity: Entity, _commands: &mut Commands) {unimplemented!()}
+    fn remove(_entity: Entity, _commands: &mut Commands) {unimplemented!()}
+}
 
+impl<T: Component + Clone + Default> RollbackCapable for T  //TODO: remove Default requirement
+//where
+//    T: NotTupleHack
+{
+    type RestoreQuery<'a> = &'a mut T;
+    type RestoreExtraParam<'a> = ();
+    type SaveQuery<'a> = &'a T;
+    type SaveExtraParam<'a> = ();
 
-// | state + process IO -> execute -> | state + process IO -> execute -> | state   ...
-// | get spawn command -> spawn entity with RollbackSpawnMarker | 
+    fn restore(&self, mut q: Mut<T>, _extra: &mut StaticSystemParam<()>) {
+        *q = self.clone();
+    }
 
-//only despawn entities with Rollback<Exists> having all false, thus indicating that the entity should be removed
-pub fn despawn_nonexistent(
-    mut commands: Commands,
-    query: Query<(Entity, &Rollback<Exists>)>,
-) {
-    for (e, r) in &query {
-        //TODO: use some form of caching, like NonExistentFor(frames: usize)
-        //the cached value can be updated when a custom save<Exists> runs
-        if r.0.iter().all(|x| !x.0) {
-            commands.entity(e).despawn_recursive();
+    fn save(q: &T, _extra: &mut StaticSystemParam<()>) -> Self {
+        q.clone()
+    }
+
+    fn insert(&self, entity: Entity, commands: &mut Commands) {
+        commands.entity(entity).insert(self.clone());
+    }
+
+    fn remove(entity: Entity, commands: &mut Commands) {
+        commands.entity(entity).remove::<T>();
+    }
+}
+
+/*
+//negative impls
+//https://github.com/rust-lang/rust/issues/68318
+trait NotTupleHack {}
+impl<T> NotTupleHack for T {}
+macro_rules! tuple_hack_impl {
+    ($($T: ident),*) => { impl<$($T,)*> !NotTupleHack for ($($T,)*) {} }
+}
+macro_rules! tuple_impl {
+    ($(($T: ident, $t: ident, $s: ident)),*) => {
+        impl<$($T: Component + Clone),*> RollbackCapable3 for ($($T,)*) {
+            type QueryItem = ();
+            type RestoreQuery<'a> = ($(&'a mut $T,)*);
+
+            fn restore(&self, ($(mut $t,)*): ($(Mut<'_, $T>,)*)) {
+                let ($($s,)*) = self;
+                $(*$t = $s.clone();)*
+            }
+
+            fn insert(&self, entity: Entity, mut commands: Commands) {
+                commands.entity(entity).insert(self.clone());
+            }
+        
+            fn remove(entity: Entity, mut commands: Commands) {
+                commands.entity(entity).remove::<Self>();
+            }
         }
     }
 }
+use bevy_utils::all_tuples;
+all_tuples!(tuple_hack_impl, 1, 15, T);
+all_tuples!(tuple_impl, 1, 15, T, t, s);
+*/
 
-//automatically update the RollbackMap when a new RollbackID component is added or removed
-//should also work when a rollback entity gets despawned
-pub fn update_rollback_map(
-    mut map: ResMut<RollbackMap>,
-    additions: Query<(Entity, &RollbackID), Added<RollbackID>>,
-    mut removals: RemovedComponents<RollbackID>,
-) {
-    for e in removals.read() {
-        map.remove(e);
+//so that the user can pick Rollback<Optiuon<T>> or Rollback<T>
+/*impl<T: RollbackCapable3> RollbackCapable3 for Option<T> {
+    type QueryItem = Option<T>;
+    type RestoreQuery<'a> = Option<T::RestoreQuery<'a>>;
+}*/
+
+//then user can do:
+//register_rollback::<T>
+//or
+//register_rollback::<Option<T>>
+
+pub trait RollbackSystems {
+    fn get_default_rollback_systems() -> SystemConfigs {
+        Self::get_default_rollback_systems_filtered::<With<RollbackID>>()
     }
-    for (e,&r) in &additions {
-        map.insert(e,r);
+    fn get_default_rollback_systems_option() -> SystemConfigs {
+        Self::get_default_rollback_systems_option_filtered::<With<RollbackID>>()
+    }
+    fn get_default_rollback_systems_filtered<F: QueryFilter + 'static>() -> SystemConfigs;
+    fn get_default_rollback_systems_option_filtered<F: QueryFilter + 'static>() -> SystemConfigs;
+}
+
+impl<T: RollbackCapable> RollbackSystems for T {
+    fn get_default_rollback_systems_filtered<F: QueryFilter + 'static>() -> SystemConfigs {
+        (
+            systems::restore_filter::<T, F>.in_set(RollbackSet::Restore),
+            systems::save_filter::<T, F>.in_set(RollbackSet::Save),
+        ).into_configs()
+    }
+    fn get_default_rollback_systems_option_filtered<F: QueryFilter + 'static>() -> SystemConfigs {
+        (
+            systems::restore_option_filter::<T, F>.in_set(RollbackSet::Restore),
+            systems::save_option_filter::<T, F>.in_set(RollbackSet::Save),
+        ).into_configs()
     }
 }
+
+
+
+
 
 //when the state should be fixed, the user could use a Query parameter to narrow down the Query
 // Query<(something),user_supplied_filter>
 //fn save<T: Component, Filter: bevy::ecs::query::QueryFilter = ()>(mut q: Query<(Entity, &Rollback<T>, &mut T), Filter>) {
 //    //TODO:
 //}
-
-//removes all entities that should not exist in the frame which is being restored, they do not need to be saved
-//when an entity is restored then all future existence should be taken as false, and the entity removed
-pub fn restore_exists_remove_nonexistent<Filter: QueryFilter>(
-    info: Res<SnapshotInfo>,
-    mut map: ResMut<RollbackMap>,
-    mut query: Query<(Entity, &mut Exists, &Rollback<Exists>), Filter>,
-    mut commands: Commands,
-) {
-    let first = info.last.saturating_sub(SNAPSHOTS_LEN as u64 - 1);
-    'outer: for (e, mut existence, r) in &mut query {
-        let ex = r.0[info.current_index()];
-        *existence = ex;
-        if !ex.0 {
-            println!("checking despawning entity {e:?}");
-            for i in (first..info.current).map(|frame| info.index(frame)) {
-                if r.0[i].0 {
-                    continue 'outer;    //the entity exists
-                }
-            }
-            println!("despawning entity {e:?}");
-            //map.remove(e);
-            commands.entity(e).despawn_recursive(); //the entity does not exist, despawn it
-        }
-    }
-}
 
 pub(crate) type DefaultFilter = ();    //With<RollbackID>;
 
@@ -215,87 +267,6 @@ pub fn save_resource_input_option<T: Resource + Clone>(
     rollback.0[info.current_index()] = None;
 }
 
-//inputs will be saved (or modified) outside of RollbackSchedule
-//but they will be restored in RollbackSchedule
-
-//maybe I could use trait objects to automatcally do
-// app.add_systems(RollbackSchedule, get_rollback_systems::<T>()); for every registered T
-
-//TODO: split this into more systems -> more user configurability and possible simplification
-pub fn run_rollback_schedule_system(world: &mut World) {
-    //this should NOT contain a loop that will go through all the frames to the last one
-    //instead this should be completed by calling this multiple times
-    //the reason for wanting this is that more delayed inputs can arive before reaching the last frame
-    //TODO: but when run inside Update it will only update 60x per second, but it should update as fast as possible -> fixed by window.present_mode = PresentMode::AutoNoVsync;
-    let time = std::time::Instant::now();
-
-    'lop: loop {    //OPTIMIZATION: this loop should not start here but only after finding one modified frame, those checks do not need to be looped
-        //if time.elapsed() > std::time::Duration::from_millis(1000/60) {break 'lop}  //TODO: the time here is arbitrary
-
-        let mut info = world.resource_mut::<SnapshotInfo>();
-        let last = info.last;
-        let snapshots = &mut info.snapshots;
-
-        let oldest = last.saturating_sub(SNAPSHOTS_LEN as u64 - 1);
-
-        let mut modified = None;
-        for frame in oldest..=last {
-            let index = (frame%SNAPSHOTS_LEN as u64) as usize;
-            if snapshots[index].modified {
-                assert!(snapshots[index].frame == frame);   //TODO: this should never be possible to fail
-                snapshots[index].modified = false;
-                modified = Some((index, snapshots[index].frame));
-                break;
-            }
-        }
-
-        if let Some((index, frame)) = modified {
-            //print!("*");
-            let next_index = (index+1)%SNAPSHOTS_LEN;
-            let next_frame = frame+1;
-
-            snapshots[next_index].frame = next_frame;
-
-            if next_frame>last {
-                //new update is supposed to happen
-                //TODO: perhaps this update should be signaled by different means to eliminate bugs
-                //that are caused by accidentally setting the last snapshot's modified=false
-                //we are creating a new frame/snapshot, by default it should have modified=false
-                snapshots[next_index].modified = false;
-                info.last = next_frame;
-            }else if next_frame==last {
-                //do not set modified to true as that would cause an update even if it should not happen
-                //also do not set it to false as that would make an update not happen if it was scheduled to happen but previous state got restored
-            }else{
-                snapshots[next_index].modified = true;
-            }
-
-            //println!("run_rollback_schedule_system frame {frame} index {index} next_index {next_index} last {} current {}",last,info.current);
-            
-            if frame != info.current {
-                info.current = frame;   //the current frame will be used for restoring, TODO: also save the index?
-                world.insert_resource(RestoreStates);
-            }else{/* the frame that should be restored is already loaded */}
-            world.insert_resource(RestoreInputs);
-            world.insert_resource(SaveStates);  //the current frame will be used for restoring, but a system will increment the current frame after running RollbackSet::Update
-
-            //println!("run_rollback_schedule_system restoring frame {frame} index {index} input_only {input_only}");
-
-            world.run_schedule(RollbackSchedule);
-
-            world.remove_resource::<RestoreStates>();
-            //world.remove_resource::<RestoreInputs>();
-            //world.remove_resource::<SaveStates>();
-        }else{
-            break 'lop
-        }
-        //break 'lop  //disable the loop for now, it is not needed thanks to window.present_mode = PresentMode::AutoNoVsync; which makes the Update schedule update as fast as possible
-    }
-    let elapsed = time.elapsed().as_secs_f32();
-    if elapsed > 0.01 {
-        println!("run_rollback_schedule_system elapsed {elapsed}");
-    }
-}
 
 //TODO: default systems that will take SnapshotUpdateEvent<T> that will simplify the usage
 

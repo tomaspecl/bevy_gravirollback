@@ -11,14 +11,14 @@ edition = "2021"
 serialize = ["serde"]
 
 [dependencies]
-bevy = "0.13"
-bevy_utils = "0.13"
+bevy = "0.15"
+bevy_utils = "0.15"
 serde = { version = "1", features = ["derive"], optional = true }
 
 # this should be only used for the examples
 [dev-dependencies]
 rand = "0.8"
-bevy-inspector-egui = "0.24"
+bevy-inspector-egui = "0.28"
 
 [profile.dev.package."*"]
 opt-level = 3
