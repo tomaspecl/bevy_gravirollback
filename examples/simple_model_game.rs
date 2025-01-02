@@ -149,10 +149,18 @@ fn spawn_ball(In((transform, id)): In<(Transform, RollbackID)>, world: &mut Worl
 fn spawn_ball2(transform: Transform, id: RollbackID, world: &mut World) -> Entity {
     let mut assets = world.resource_mut::<Assets<Mesh>>();
     let mesh = assets.add(Sphere::default());
+    let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
+    let material = materials.add(StandardMaterial {
+        base_color: Color::BLACK,
+        ..Default::default()
+    });
 
     println!("spawning ball");
 
-    world.spawn(Mesh3d(mesh)).insert((
+    world.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(material)
+    )).insert((
         BallMarker,
         id,
         Rollback::<Exists>::default(),
@@ -160,13 +168,20 @@ fn spawn_ball2(transform: Transform, id: RollbackID, world: &mut World) -> Entit
     )).id()
 }
 
-fn spawn_ball3(transform: Transform, id: RollbackID) -> impl Fn(Commands, ResMut<Assets<Mesh>>) -> Entity {
-    move |mut commands, mut assets| {
+fn spawn_ball3(transform: Transform, id: RollbackID) -> impl Fn(Commands, ResMut<Assets<Mesh>>, ResMut<Assets<StandardMaterial>>) -> Entity {
+    move |mut commands, mut assets, mut materials| {
         let mesh = assets.add(Sphere::default());
+        let material = materials.add(StandardMaterial {
+            base_color: Color::BLACK,
+            ..Default::default()
+        });
 
         println!("spawning ball");
 
-        commands.spawn(Mesh3d(mesh)).insert((
+        commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material))
+        ).insert((
             BallMarker,
             id,
             make_rollback(Exists(true)),

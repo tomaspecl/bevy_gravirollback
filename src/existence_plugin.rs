@@ -46,6 +46,7 @@ impl Plugin for ExistencePlugin {
 
 //can use Query<..., Changed<Exists>> to run code that handles the "virtual" despawn and respawn when needed
 #[derive(Component, Reflect, Clone, Copy)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub struct Exists(pub bool);
 impl Default for Exists {
     fn default() -> Self { Exists(false) }  //TODO: maybe it should be Exists(true)
