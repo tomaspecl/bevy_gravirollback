@@ -1,12 +1,10 @@
 use bevy::prelude::*;
 use bevy::ecs::query::{WorldQuery, QueryData, QueryFilter};
-use bevy::ecs::schedule::SystemConfigs;
-use bevy::ecs::system::{StaticSystemParam, SystemParam, SystemParamItem};
+use bevy::ecs::system::{StaticSystemParam, SystemParam};
 
 use crate::*;
-use crate::schedule_plugin::*;
 
-pub trait RollbackCapable: Default + Send + Sync + 'static {    //TODO: remove Default requirement
+pub trait RollbackCapable: Send + Sync + 'static {
     type RestoreQuery<'a>: QueryData;
     /// Extra restore system parameters that can be used for anything
     type RestoreExtraParam<'a>: SystemParam;
@@ -24,7 +22,7 @@ pub trait RollbackCapable: Default + Send + Sync + 'static {    //TODO: remove D
     fn remove(_entity: Entity, _commands: &mut Commands) {unimplemented!()}
 }
 
-impl<T: Component + Clone + Default> RollbackCapable for T  //TODO: remove Default requirement
+impl<T: Component + Clone> RollbackCapable for T
 //where
 //    T: NotTupleHack
 {
@@ -84,7 +82,7 @@ all_tuples!(tuple_hack_impl, 1, 15, T);
 all_tuples!(tuple_impl, 1, 15, T, t, s);
 */
 
-//so that the user can pick Rollback<Optiuon<T>> or Rollback<T>
+//so that the user can pick Rollback<Option<T>> or Rollback<T>
 /*impl<T: RollbackCapable3> RollbackCapable3 for Option<T> {
     type QueryItem = Option<T>;
     type RestoreQuery<'a> = Option<T::RestoreQuery<'a>>;
@@ -94,35 +92,6 @@ all_tuples!(tuple_impl, 1, 15, T, t, s);
 //register_rollback::<T>
 //or
 //register_rollback::<Option<T>>
-
-pub trait RollbackSystems {
-    fn get_default_rollback_systems() -> SystemConfigs {
-        Self::get_default_rollback_systems_filtered::<With<RollbackID>>()
-    }
-    fn get_default_rollback_systems_option() -> SystemConfigs {
-        Self::get_default_rollback_systems_option_filtered::<With<RollbackID>>()
-    }
-    fn get_default_rollback_systems_filtered<F: QueryFilter + 'static>() -> SystemConfigs;
-    fn get_default_rollback_systems_option_filtered<F: QueryFilter + 'static>() -> SystemConfigs;
-}
-
-impl<T: RollbackCapable> RollbackSystems for T {
-    fn get_default_rollback_systems_filtered<F: QueryFilter + 'static>() -> SystemConfigs {
-        (
-            systems::restore_filter::<T, F>.in_set(RollbackSet::Restore),
-            systems::save_filter::<T, F>.in_set(RollbackSet::Save),
-        ).into_configs()
-    }
-    fn get_default_rollback_systems_option_filtered<F: QueryFilter + 'static>() -> SystemConfigs {
-        (
-            systems::restore_option_filter::<T, F>.in_set(RollbackSet::Restore),
-            systems::save_option_filter::<T, F>.in_set(RollbackSet::Save),
-        ).into_configs()
-    }
-}
-
-
-
 
 
 //when the state should be fixed, the user could use a Query parameter to narrow down the Query
@@ -135,57 +104,59 @@ pub(crate) type DefaultFilter = ();    //With<RollbackID>;
 
 //TODO: allow using Bundles, tuples, etc... for T, example: Rollback<(Transform, Velocity)>
 //the default restore and save rollback systems, the user can use their own
-pub fn restore<T: RollbackCapable>(
-    info: Res<SnapshotInfo>,
-    query: Query<(T::RestoreQuery<'_>, &Rollback<T>), DefaultFilter>,
+pub fn restore<T: RollbackCapable, const LEN: usize>(
+    current_frame: Res<Frame>,
+    query: Query<(T::RestoreQuery<'_>, &Rollback<T, LEN>), DefaultFilter>,
     extra: StaticSystemParam<T::RestoreExtraParam<'_>>,
 ) {
-    restore_filter(info, query, extra);
+    restore_filter(current_frame, query, extra);
 }
 
-pub fn restore_option<T: RollbackCapable>(
-    info: Res<SnapshotInfo>,
-    query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), DefaultFilter>,
+pub fn restore_option<T: RollbackCapable, const LEN: usize>(
+    current_frame: Res<Frame>,
+    query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>, LEN>), DefaultFilter>,
     extra: StaticSystemParam<T::RestoreExtraParam<'_>>,
     commands: Commands,
 ) {
-    restore_option_filter(info, query, extra, commands);
+    restore_option_filter(current_frame, query, extra, commands);
 }
 
-pub fn save<T: RollbackCapable>(
-    info: Res<SnapshotInfo>,
-    query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), DefaultFilter>,
+pub fn save<T: RollbackCapable, const LEN: usize>(
+    current_frame: Res<Frame>,
+    query: Query<(T::SaveQuery<'_>, &mut Rollback<T, LEN>), DefaultFilter>,
     extra: StaticSystemParam<T::SaveExtraParam<'_>>,
 ) {
-    save_filter(info, query, extra);
+    save_filter(current_frame, query, extra);
 }
 
-pub fn save_option<T: RollbackCapable>(
-    info: Res<SnapshotInfo>,
-    query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), DefaultFilter>,
+pub fn save_option<T: RollbackCapable, const LEN: usize>(
+    current_frame: Res<Frame>,
+    query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>, LEN>), DefaultFilter>,
     extra: StaticSystemParam<T::SaveExtraParam<'_>>,
 ) {
-    save_option_filter(info, query, extra);
+    save_option_filter(current_frame, query, extra);
 }
 
-pub fn restore_filter<T: RollbackCapable, Filter: QueryFilter>(
-    info: Res<SnapshotInfo>,
-    mut query: Query<(T::RestoreQuery<'_>, &Rollback<T>), Filter>,
+pub fn restore_filter<T: RollbackCapable, const LEN: usize, Filter: QueryFilter>(
+    current_frame: Res<Frame>,
+    mut query: Query<(T::RestoreQuery<'_>, &Rollback<T, LEN>), Filter>,
     mut extra: StaticSystemParam<T::RestoreExtraParam<'_>>,
 ) {
+    let current_index = crate::index::<LEN>(current_frame.0);
     for (q, r) in &mut query {
-        r.0[info.current_index()].restore(q, &mut extra);
+        r.0[current_index].restore(q, &mut extra);
     }
 }
 
-pub fn restore_option_filter<T: RollbackCapable, Filter: QueryFilter>(
-    info: Res<SnapshotInfo>,
-    mut query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>>), Filter>,
+pub fn restore_option_filter<T: RollbackCapable, const LEN: usize, Filter: QueryFilter>(
+    current_frame: Res<Frame>,
+    mut query: Query<(Entity, Option<T::RestoreQuery<'_>>, &Rollback<Option<T>, LEN>), Filter>,
     mut extra: StaticSystemParam<T::RestoreExtraParam<'_>>,
     mut commands: Commands,
 ) {
+    let current_index = crate::index::<LEN>(current_frame.0);
     for (e, q, r) in &mut query {
-        match (&r.0[info.current_index()], q) {
+        match (&r.0[current_index], q) {
             (Some(to_restore), None) => to_restore.insert(e, &mut commands),
             (Some(to_restore), Some(q)) => to_restore.restore(q, &mut extra),
             (None, Some(_)) => T::remove(e, &mut commands),
@@ -194,44 +165,48 @@ pub fn restore_option_filter<T: RollbackCapable, Filter: QueryFilter>(
     }
 }
 
-pub fn save_filter<T: RollbackCapable, Filter: QueryFilter>(
-    info: Res<SnapshotInfo>,
-    mut query: Query<(T::SaveQuery<'_>, &mut Rollback<T>), Filter>,
+pub fn save_filter<T: RollbackCapable, const LEN: usize, Filter: QueryFilter>(
+    current_frame: Res<Frame>,
+    mut query: Query<(T::SaveQuery<'_>, &mut Rollback<T, LEN>), Filter>,
     mut extra: StaticSystemParam<T::SaveExtraParam<'_>>,
 ) {
+    let current_index = crate::index::<LEN>(current_frame.0);
     for (q, mut r) in &mut query {
-        r.0[info.current_index()] = T::save(q, &mut extra);
+        r.0[current_index] = T::save(q, &mut extra);
     }
 }
 
-pub fn save_option_filter<T: RollbackCapable, Filter: QueryFilter>(
-    info: Res<SnapshotInfo>,
-    mut query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>>), Filter>,
+pub fn save_option_filter<T: RollbackCapable, const LEN: usize, Filter: QueryFilter>(
+    current_frame: Res<Frame>,
+    mut query: Query<(Option<T::SaveQuery<'_>>, &mut Rollback<Option<T>, LEN>), Filter>,
     mut extra: StaticSystemParam<T::SaveExtraParam<'_>>,
 ) {
+    let current_index = crate::index::<LEN>(current_frame.0);
     for (q, mut r) in &mut query {
-        r.0[info.current_index()] = q.map(|q | T::save(q, &mut extra));
+        r.0[current_index] = q.map(|q| T::save(q, &mut extra));
     }
 }
 
 //make the same systems for Resources
 //the user can then use arbitrary types for storing Inputs and still have rollback work for them
 
-pub fn restore_resource<T: Resource + Clone + Default>( //TODO: remove Default requirement
-    info: Res<SnapshotInfo>,
-    rollback: Res<Rollback<T>>,
+pub fn restore_resource<T: Resource + Clone + Default, const LEN: usize>( //TODO: remove Default requirement
+    current_frame: Res<Frame>,
+    rollback: Res<Rollback<T, LEN>>,
     mut resource: ResMut<T>,
 ) {
-    *resource = rollback.0[info.current_index()].clone();
+    let current_index = crate::index::<LEN>(current_frame.0);
+    *resource = rollback.0[current_index].clone();
 }
 
-pub fn restore_resource_option<T: Resource + Clone>(
-    info: Res<SnapshotInfo>,
-    rollback: Res<Rollback<Option<T>>>,
+pub fn restore_resource_option<T: Resource + Clone, const LEN: usize>(
+    current_frame: Res<Frame>,
+    rollback: Res<Rollback<Option<T>, LEN>>,
     resource: Option<ResMut<T>>,
     mut commands: Commands,
 ) {
-    if let Some(res) = &rollback.0[info.current_index()] {
+    let current_index = crate::index::<LEN>(current_frame.0);
+    if let Some(res) = &rollback.0[current_index] {
         if let Some(mut resource) = resource {
             *resource = res.clone();
         }else{
@@ -242,29 +217,46 @@ pub fn restore_resource_option<T: Resource + Clone>(
     }
 }
 
-pub fn save_resource<T: Resource + Clone + Default>( //TODO: remove Default requirement
-    info: Res<SnapshotInfo>,
-    mut rollback: ResMut<Rollback<T>>,
+pub fn save_resource<T: Resource + Clone + Default, const LEN: usize>( //TODO: remove Default requirement
+    current_frame: Res<Frame>,
+    mut rollback: ResMut<Rollback<T, LEN>>,
     resource: Res<T>,
 ) {
-    rollback.0[info.current_index()] = resource.clone();
+    let current_index = crate::index::<LEN>(current_frame.0);
+    rollback.0[current_index] = resource.clone();
 }
 
-pub fn save_resource_option<T: Resource + Clone>(
-    info: Res<SnapshotInfo>,
-    mut rollback: ResMut<Rollback<Option<T>>>,
+pub fn save_resource_option<T: Resource + Clone, const LEN: usize>(
+    current_frame: Res<Frame>,
+    mut rollback: ResMut<Rollback<Option<T>, LEN>>,
     resource: Option<Res<T>>,
 ) {
-    rollback.0[info.current_index()] = resource.map(|x| x.clone());
+    let current_index = crate::index::<LEN>(current_frame.0);
+    rollback.0[current_index] = resource.map(|x| x.clone());
 }
 
-//more like clear_input, save_input should run after RollbackProcessSet::HandleIO
-//this should not be needed to run in RollbackSchedule because this will delete previously collected inputs
-pub fn save_resource_input_option<T: Resource + Clone>(
-    info: Res<SnapshotInfo>,
-    mut rollback: ResMut<Rollback<Option<T>>>,
+pub fn clear_resource_input_default<T: Resource + Default, const LEN: usize>(
+    current_frame: Res<Frame>,
+    last_frame: Res<LastFrame>,
+    mut rollback: ResMut<Rollback<T, LEN>>,
 ) {
-    rollback.0[info.current_index()] = None;
+    if current_frame.0 > last_frame.0 {
+        //this input is completely new, so it should be cleared
+        let current_index = crate::index::<LEN>(current_frame.0);
+        rollback.0[current_index] = default();
+    }
+}
+
+pub fn clear_resource_input_option<T: Resource + Clone, const LEN: usize>(
+    current_frame: Res<Frame>,
+    last_frame: Res<LastFrame>,
+    mut rollback: ResMut<Rollback<Option<T>, LEN>>,
+) {
+    if current_frame.0 > last_frame.0 {
+        //this input is completely new, so it should be cleared
+        let current_index = crate::index::<LEN>(current_frame.0);
+        rollback.0[current_index] = None;
+    }
 }
 
 

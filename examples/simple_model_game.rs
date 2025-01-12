@@ -1,8 +1,4 @@
-use bevy_gravirollback::systems::*;
-use bevy_gravirollback::*;
-use bevy_gravirollback::for_user::*;
-use bevy_gravirollback::schedule_plugin::*;
-use bevy_gravirollback::existence_plugin::*;
+use bevy_gravirollback::prelude::*;
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -32,23 +28,36 @@ use std::time::Duration;
 // As it would not be fair for the ball player to loose just because some
 // packet got delayed it has to be corrected by the rollback, that is its job.
 
+//the Rollback storage length (in frames)
+const LEN: usize = 128;
+
+//define our Rollback with our LEN so that we dont have to always write Rollback<T, LEN>
+type Rollback<T> = bevy_gravirollback::Rollback<T, LEN>;
+
+//copied from bevy_gravirollback::for_user and modified to use our LEN
+fn make_rollback<T: Component + Default>(component: T) -> (T, Rollback<T>) {
+    (component, Rollback::default())
+}
+
 fn main() {
     let mut app = App::new();
 
     app.add_plugins((
         DefaultPlugins,
         WorldInspectorPlugin::new(),
-        RollbackPlugin,
-        RollbackSchedulePlugin::default(),
-        ExistencePlugin,
+        RollbackPlugin::<LEN>,
+        RollbackSchedulePlugin::<LEN>::default(),
+        ExistencePlugin::<LEN>,
     ))
 
     //TODO: these should be probably automaticaly registered
-    .register_type::<RestoreStates>()
-    .register_type::<RestoreInputs>()
-    .register_type::<SaveStates>()
-    .register_type::<SnapshotInfo>()
+    .register_type::<Rollback<Modified>>()
+    .register_type::<Rollback<Frame>>()
     .register_type::<RollbackMap>()
+    .register_type::<Frame>()
+    .register_type::<LastFrame>()
+    .register_type::<WantedFrame>()
+    .register_type::<RollbackUpdateConfig>()
     //and these too
     .register_type::<RollbackID>()
     .register_type::<Exists>()
@@ -68,22 +77,29 @@ fn main() {
     .add_systems(Update,(
         advance_frame,
         get_input,
-    ).in_set(RollbackProcessSet::HandleIO))
+    ).in_set(RollbackProcessSet::HandleIO));
 
-    .add_systems(RollbackSchedule,(     
-        Transform::get_default_rollback_systems(),                                                              //
-        restore_resource_option::<PlayerInput>.in_set(RollbackSet::RestoreInputs),                              //
-        save_resource_input_option::<PlayerInput>.in_set(RollbackSet::Save),//more like clear_input, TODO: is it needed//
-    ))                                                                                                          //  THIS SHOULD BE AUTOMATIC
+    RollbackSystemConfigurator::<LEN>::default()
+        .add::<(
+            Transform,  //even when having just one type, you have to wrap it into a tuple like this: (T,)
+            //Mesh3d,   //you can register multiple at the same time
+            //GlobalTransform,
+            //etc...
+        )>()
+        .apply(&mut app);
+    
+    app
+    .add_systems(RollbackSave,clear_resource_input_option::<PlayerInput,LEN>)
+    .add_systems(RollbackUpdate, restore_resource_option::<PlayerInput,LEN>.in_set(RollbackUpdateSet::LoadInputs))
     .insert_resource(Rollback::<Option<PlayerInput>>::default())
     
-    .add_systems(RollbackSchedule,(
+    .add_systems(RollbackUpdate,(
         (
             jump,
             fall,
             ball_existence,
         ).chain()
-    ).in_set(RollbackSet::Update))
+    ).in_set(RollbackUpdateSet::Update))
 
     .insert_resource(WaitingInputs(Vec::new()))
     ;
@@ -226,27 +242,26 @@ struct WaitingInputs(Vec<u64>);
 fn advance_frame(
     time: Res<Time>,
     mut timer: ResMut<UpdateTimer>,
-    mut info: ResMut<SnapshotInfo>,
+    last: Res<LastFrame>,
+    current: Res<Frame>,
+    mut wanted_frame: ResMut<WantedFrame>,
     mut counter: Local<u32>,
     mut waiting: ResMut<WaitingInputs>,
 ) {
     let delay = 1000/60;
 
-    if info.last==info.current {
+    if last.0 == current.0 {
         if time.elapsed() - timer.0 >= Duration::from_millis(delay) {
             timer.0 += Duration::from_millis(delay);
 
-            print!("\nadvancing frame {} ",info.current);
-            {   //this should be instead done by creating an event AdvanceFrameEvent or something like that
-                let last_index = (info.last%SNAPSHOTS_LEN as u64) as usize;
-                info.snapshots[last_index].modified = true;
-            }
+            print!("\nadvancing frame {} ",current.0);
+            wanted_frame.0 = last.0 + 1;    //this could be instead done by creating an event AdvanceFrameEvent or something like that
     
             *counter += 1;
             if *counter==FRAME_DELAY {
                 *counter = 0;
     
-                waiting.0.push(info.last);
+                waiting.0.push(last.0);
             }
         }
     }
@@ -261,7 +276,8 @@ struct NewInputEvent {
 
 fn get_input(
     mut waiting: ResMut<WaitingInputs>,
-    mut info: ResMut<SnapshotInfo>,
+    mut modified: ResMut<Rollback<Modified>>,
+    frames: Res<Rollback<Frame>>,
     mut inputs: ResMut<Rollback<Option<PlayerInput>>>,
     //mut events: EventWriter<NewInputEvent>,
 ) {
@@ -275,12 +291,12 @@ fn get_input(
         let frame = waiting.0.remove(0);
         
         //this should be done automaticaly:
-        let index = info.index(frame);
-        if info.snapshots[index].frame==frame {
+        let index = index::<LEN>(frame);
+        if frames[index].0 == frame {
             //insert the input
             inputs.0[index] = Some(PlayerInput);
 
-            info.snapshots[index].modified = true;
+            modified[index].0 = true;
         }else{
             todo!("dropped snapshot");
         }

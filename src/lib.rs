@@ -1,5 +1,3 @@
-#[cfg(old)]
-pub mod old;
 pub mod rollback_config_plugin;
 
 pub mod schedule_plugin;
@@ -12,9 +10,20 @@ use bevy::ecs::component::ComponentId;
 use bevy::ecs::world::DeferredWorld;
 use bevy::utils::HashMap;
 
+pub mod prelude {
+    pub use crate::*;
+    pub use crate::systems::*;
+    pub use crate::for_user::*;
+    pub use crate::schedule_plugin::*;
+    pub use crate::existence_plugin::*;
+    pub use crate::rollback_config_plugin::*;
+}
+
 // *****************************
 //TODO: check comments and names and update them
 // *****************************
+
+//TODO: do serialization for most structs, or perhaps Reflect is sufficient?
 
 // A snapshot contains the state of rollback entities and the player inputs of a single game frame
 
@@ -28,22 +37,23 @@ use bevy::utils::HashMap;
 //bevy::ecs::system::SystemState can be used for caching access to certain data through &mut World -> speed up
 //let components = world.inspect_entity(entity);     //can be used to get Components of an entity
 
+// future ideal for how configurable and generic this plugin should be
+// imagine a multiplayer game with multiple simulated multiplayer minigames with simulated networking delay
+// you should be able to apply the outer rollback schedule to the rollback of the minigames
+// so you should be able to rollback the rollbacks
+// or said differently: have a simulation of some rollback enabled system (not in the sense of ECS system), and the simulation itself has rollback
+
 //TODO: component change detection should work correctly even when changing frames -> maybe use marker Component to signal change?
-
-
-pub const SNAPSHOTS_LEN: usize = 128;    //TODO: how to make this changable by the user of this library? maybe extern?
-//maybe I can wrap the whole lib in a macro and let the user instanciate it with their specified SNAPSHOTS_LEN? this would be crazy
-//maybe some configuration/compilation flag can be passed in Cargo.toml ?
 
 //TODO: figure out how to remove the Default requirement for #[reflect(Resource)]
 
 //TODO: use a flag to choose if the size is growable, size is fixed by default
-#[derive(Component, Resource, Reflect, Clone)]
+#[derive(Component, Resource, Reflect, Deref, DerefMut, Clone)]
 #[reflect(Resource)]
-pub struct Rollback<T: Default /* ideally remove this bound, it is mainly for Reflect */>(pub [T; SNAPSHOTS_LEN]);   //this version has fixed size, it should be faster as there is no pointer dereference, question is if it matters or was it just premature optimization
-impl<T: Default> Default for Rollback<T> {
+pub struct Rollback<T, const LEN: usize>(pub [T; LEN]);   //this version has fixed size, it should be faster as there is no pointer dereference, question is if it matters or was it just premature optimization
+impl<T: Default, const LEN: usize> Default for Rollback<T, LEN> {
     fn default() -> Self {
-        Self(std::array::from_fn(|_| T::default()))     //this had to be done manualy because the #[derive(Default)] macro could not handle it with big SNAPSHOTS_LEN
+        Self(std::array::from_fn(|_| T::default()))     //this had to be done manualy because the #[derive(Default)] macro could not handle it with big LEN
     }
 }
 
@@ -129,40 +139,43 @@ impl RollbackMap {
     }
 }
 
-
-#[derive(Resource, Reflect, Default)]
+/// The currently loaded frame, or the frame that should be restored
+#[derive(Resource, Reflect, Default, Clone, Copy, Debug)]
 #[reflect(Resource)]
-pub struct SnapshotInfo {
-    /// The last frame in storage
-    pub last: u64,
-    /// The currently loaded frame, or the frame that should be restored
-    pub current: u64,
-    pub snapshots: Vec<Snapshot>,   //TODO: this should probably not belong to here
-}
-impl SnapshotInfo {
-    /// Compute the index in storage of the specified frame
-    pub fn index(&self, frame: u64) -> usize { (frame%SNAPSHOTS_LEN as u64) as usize }  //TODO: &self is not needed now but in the future SNAPSHOTS_LEN could be part of the struct
-    /// Compute the index in storage of the current frame
-    pub fn current_index(&self) -> usize { self.index(self.current) }
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+pub struct Frame(pub u64);
+
+// /// The index into storage of currently loaded frame, or the frame that should be restored.
+// /// Used for rollback restore/save systems to avoid recalculating this value inside them for no reason.
+// #[derive(Resource, Reflect Default, Clone, Copy, Debug)]
+// #[reflect(Resource)]
+// pub struct Index<const LEN: usize>(pub usize);
+
+/// The last frame in storage
+#[derive(Resource, Reflect, Default, Clone, Copy, Debug)]
+#[reflect(Resource)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+pub struct LastFrame(pub u64);
+
+pub fn index<const LEN: usize>(frame: u64) -> usize {
+    (frame%LEN as u64) as usize
 }
 
-#[derive(Reflect, Clone)]
-pub struct Snapshot {
-    pub frame: u64,
-    pub modified: bool,
-}
+#[derive(Reflect, Default, Clone, Copy, Debug)]
+pub struct Modified(pub bool);
 
-pub struct RollbackPlugin;
+pub struct RollbackPlugin<const LEN: usize>;
 
 //TODO: use *_system for names of systems probably?
-impl Plugin for RollbackPlugin {
+impl<const LEN: usize> Plugin for RollbackPlugin<LEN> {
     fn build(&self, app: &mut App) {
-        app.insert_resource(SnapshotInfo {
-            last: 0,
-            current: 0,
-            snapshots: vec![Snapshot { frame: 0, modified: false };SNAPSHOTS_LEN],
-        });
+        app
+        .init_resource::<Frame>()
+        //.init_resource::<Index>()
+        .init_resource::<LastFrame>()
+        .init_resource::<Rollback<Frame, LEN>>()
+        .init_resource::<Rollback<Modified, LEN>>()
 
-        app.insert_resource(RollbackMap(HashMap::new(), HashMap::new()));
+        .init_resource::<RollbackMap>();
     }
 }

@@ -2,7 +2,7 @@ use crate::*;
 
 // this file contains helper functions and structs for the library user
 
-pub fn make_rollback<T: Component + Default>(component: T) -> (T, Rollback<T>) {
+pub fn make_rollback<T: Component + Default, const LEN: usize>(component: T) -> (T, Rollback<T, LEN>) {
     (component, Rollback::default())
 }
 

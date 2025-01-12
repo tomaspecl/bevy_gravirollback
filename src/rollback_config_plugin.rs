@@ -1,10 +1,123 @@
 use bevy::prelude::*;
+use bevy::ecs::query::QueryFilter;
+use bevy::ecs::schedule::ScheduleLabel;
+use bevy::ecs::schedule::SystemConfigs;
+use bevy::ecs::intern::Interned;
 
 use crate::*;
 use crate::schedule_plugin::*;
 use crate::systems::*;
 
+pub struct RollbackSystemConfigurator<const LEN: usize> {
+    pub restore: Option<Interned<dyn ScheduleLabel>>,
+    pub save: Option<Interned<dyn ScheduleLabel>>,
+    restore_systems: Vec<SystemConfigs>,
+    save_systems: Vec<SystemConfigs>,
+}
+
+impl<const LEN: usize> Default for RollbackSystemConfigurator<LEN> {
+    fn default() -> Self {
+        Self {
+            restore: Some(RollbackRestore.intern()),
+            save: Some(RollbackSave.intern()),
+            restore_systems: vec![],
+            save_systems: vec![],
+        }
+    }
+}
+
+impl<const LEN: usize> RollbackSystemConfigurator<LEN> {
+    /// You can use default() to use RollbackRestore and RollbackSave respectively
+    pub fn new(restore: Option<impl ScheduleLabel>, save: Option<impl ScheduleLabel>) -> Self {
+        Self {restore: restore.map(|x| x.intern()), save: save.map(|x| x.intern()), ..default()}
+    }
+
+    pub fn apply(&mut self, app: &mut App) {
+        self.restore.map(|schedule| self.restore_systems.drain(..).for_each(|system| {app.add_systems(schedule, system);}));
+        self.save.map(|schedule| self.save_systems.drain(..).for_each(|system| {app.add_systems(schedule, system);}));
+    }
+
+    pub fn add<T: RollbackCapableGroup>(&mut self) -> &mut Self {
+        self.restore_systems.extend(T::get_restore::<LEN,DefaultFilter>());
+        self.save_systems.extend(T::get_save::<LEN,DefaultFilter>());
+        self
+    }
+    pub fn add_option<T: RollbackCapableGroup>(&mut self) -> &mut Self {
+        self.restore_systems.extend(T::get_restore_option::<LEN,DefaultFilter>());
+        self.save_systems.extend(T::get_save_option::<LEN,DefaultFilter>());
+        self
+    }
+    pub fn add_filter<T: RollbackCapableGroup, Filter: QueryFilter + 'static>(&mut self) -> &mut Self {
+        self.restore_systems.extend(T::get_restore::<LEN,Filter>());
+        self.save_systems.extend(T::get_save::<LEN,Filter>());
+        self
+    }
+    pub fn add_option_filter<T: RollbackCapableGroup, Filter: QueryFilter + 'static>(&mut self) -> &mut Self {
+        self.restore_systems.extend(T::get_restore_option::<LEN,Filter>());
+        self.save_systems.extend(T::get_save_option::<LEN,Filter>());
+        self
+    }
+}
+
+pub trait RollbackCapableGroup {
+    fn get_restore<const LEN: usize, Filter: QueryFilter + 'static>() -> Vec<SystemConfigs>;
+    fn get_restore_option<const LEN: usize, Filter: QueryFilter + 'static>() -> Vec<SystemConfigs>;
+    fn get_save<const LEN: usize, Filter: QueryFilter + 'static>() -> Vec<SystemConfigs>;
+    fn get_save_option<const LEN: usize, Filter: QueryFilter + 'static>() -> Vec<SystemConfigs>;
+}
+
+macro_rules! impl_rollback_capable_tuple_config {
+    ($($T:ident),*) => {
+        impl<$($T: RollbackCapable),*> RollbackCapableGroup for ($($T,)*) {
+            fn get_restore<const LEN: usize, Filter: QueryFilter + 'static>() -> Vec<SystemConfigs> {
+                vec![$(systems::restore_filter::<$T,LEN,Filter>.into_configs(),)*]
+            }
+            fn get_restore_option<const LEN: usize, Filter: QueryFilter + 'static>() -> Vec<SystemConfigs> {
+                vec![$(systems::restore_option_filter::<$T,LEN,Filter>.into_configs(),)*]
+            }
+            fn get_save<const LEN: usize, Filter: QueryFilter + 'static>() -> Vec<SystemConfigs> {
+                vec![$(systems::save_filter::<$T,LEN,Filter>.into_configs(),)*]
+            }
+            fn get_save_option<const LEN: usize, Filter: QueryFilter + 'static>() -> Vec<SystemConfigs> {
+                vec![$(systems::save_option_filter::<$T,LEN,Filter>.into_configs(),)*]
+            }
+        }
+    };
+}
+
+use bevy_utils::all_tuples;
+all_tuples!(impl_rollback_capable_tuple_config, 1, 15, T);
+
+/*
+pub trait RollbackSystems {
+    fn get_default_rollback_systems<const LEN: usize>() -> SystemConfigs {
+        Self::get_default_rollback_systems_filtered::<LEN, With<RollbackID>>()
+    }
+    fn get_default_rollback_systems_option<const LEN: usize>() -> SystemConfigs {
+        Self::get_default_rollback_systems_option_filtered::<LEN, With<RollbackID>>()
+    }
+    fn get_default_rollback_systems_filtered<const LEN: usize, F: QueryFilter + 'static>() -> SystemConfigs;
+    fn get_default_rollback_systems_option_filtered<const LEN: usize, F: QueryFilter + 'static>() -> SystemConfigs;
+}
+
+impl<T: RollbackCapable> RollbackSystems for T {
+    fn get_default_rollback_systems_filtered<const LEN: usize, F: QueryFilter + 'static>() -> SystemConfigs {
+        (
+            systems::restore_filter::<T, LEN, F>.in_set(RollbackSet::Restore),
+            systems::save_filter::<T, LEN, F>.in_set(RollbackSet::Save),
+        ).into_configs()
+    }
+    fn get_default_rollback_systems_option_filtered<const LEN: usize, F: QueryFilter + 'static>() -> SystemConfigs {
+        (
+            systems::restore_option_filter::<T, LEN, F>.in_set(RollbackSet::Restore),
+            systems::save_option_filter::<T, LEN, F>.in_set(RollbackSet::Save),
+        ).into_configs()
+    }
+}
+*/
+
 //experimental work in progress
+/*
 
 pub trait RollbackStorage: Send + Sync {
     fn restore(self: Box<Self>, entity_mut: &mut EntityWorldMut);  //TODO: can this be moved to RollbackRegistry?
@@ -122,6 +235,8 @@ impl<T: Component + Send + Sync + Clone + Default> RollbackComponentConfig<T> { 
         self.default_systems().default_getter()
     }
 }
+
+*/
 
 /*
 this will be used in Plugin configuration
